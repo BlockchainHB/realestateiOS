@@ -1,0 +1,12 @@
+{
+  "fixtureNotice": "Synthetic test data only. This is not a captured or claimed production Interac format.",
+  "messageId": "synthetic-message-deposit-001",
+  "historyId": "10001",
+  "from": "Synthetic Interac Fixture <fixture@example.test>",
+  "subject": "Synthetic Interac e-Transfer test notification",
+  "receivedAt": "2026-08-01T15:30:00.000Z",
+  "bodyText": "SYNTHETIC INTERAC E-TRANSFER TEST NOTICE\nEvent: deposit_completed\nSender: Synthetic Payer Alpha\nAmount CAD: 1450.00\nReceived At: 2026-08-01T15:30:00.000Z\nReference: SYNTHETIC-REF-001\n",
+  "headers": {
+    "x-realestate-synthetic-interac-fixture": "v1"
+  }
+}

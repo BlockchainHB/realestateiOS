@@ -1,0 +1,10 @@
+{
+  "fixtureNotice": "Synthetic test data only. This deliberately lacks the fixture marker and must never be parsed as a payment.",
+  "messageId": "synthetic-message-unsupported-001",
+  "historyId": "10003",
+  "from": "Interac-like Sender <fixture@example.test>",
+  "subject": "An e-Transfer format that is not supported",
+  "receivedAt": "2026-08-03T10:00:00.000Z",
+  "bodyText": "This content is intentionally unrecognized.",
+  "headers": {}
+}

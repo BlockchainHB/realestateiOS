@@ -1,0 +1,10 @@
+{
+  "fixtureNotice": "Synthetic unrelated email used to prove minimum retention behavior.",
+  "messageId": "synthetic-message-unrelated-001",
+  "historyId": "10004",
+  "from": "Building Newsletter <newsletter@example.test>",
+  "subject": "Synthetic monthly newsletter",
+  "receivedAt": "2026-08-04T10:00:00.000Z",
+  "bodyText": "This unrelated synthetic message must be ignored.",
+  "headers": {}
+}
