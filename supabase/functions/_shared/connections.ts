@@ -1,4 +1,4 @@
-import { encryptJson } from "./crypto.ts";
+import { decryptJson, encryptJson } from "./crypto.ts";
 import { database } from "./database.ts";
 import { HttpError } from "./http.ts";
 import type { GoogleTokenBundle } from "./oauth.ts";
@@ -73,14 +73,26 @@ export async function connectMailbox(input: {
     const existingConnections = await transaction<{
       provider_account_id: string;
       last_history_id: string | null;
+      revocation_pending: boolean;
     }[]>`
-      select connection.provider_account_id, state.last_history_id
+      select connection.provider_account_id,
+             state.last_history_id,
+             revocation.connection_id is not null as revocation_pending
       from public.gmail_connections connection
       left join public.gmail_sync_states state
         on state.connection_id = connection.id
+      left join private.gmail_token_revocations revocation
+        on revocation.connection_id = connection.id
       where connection.organization_id = ${input.organizationId}
       for update of connection
     `;
+    if (existingConnections[0]?.revocation_pending) {
+      throw new HttpError(
+        409,
+        "gmail_revocation_pending",
+        "Retry the previous Google disconnect before reconnecting this mailbox.",
+      );
+    }
     if (
       existingConnections[0] &&
       existingConnections[0].provider_account_id !== providerAccountId
@@ -234,9 +246,40 @@ export async function disconnectMailbox(input: {
   connectionId: string;
   organizationId: string;
   userId: string;
-  revocationOutcome: string;
+  refreshToken: string | null;
 }): Promise<void> {
+  const refreshTokenCiphertext = input.refreshToken
+    ? await encryptJson({ refreshToken: input.refreshToken })
+    : null;
   await database().begin(async (transaction) => {
+    const connections = await transaction<{ id: string }[]>`
+      select id
+      from public.gmail_connections
+      where id = ${input.connectionId}
+        and organization_id = ${input.organizationId}
+      for update
+    `;
+    if (!connections[0]) {
+      throw new HttpError(
+        404,
+        "gmail_connection_not_found",
+        "The Gmail connection was not found.",
+      );
+    }
+    if (refreshTokenCiphertext) {
+      await transaction`
+        insert into private.gmail_token_revocations (
+          connection_id,
+          refresh_token_ciphertext
+        ) values (
+          ${input.connectionId},
+          ${refreshTokenCiphertext}
+        )
+        on conflict (connection_id) do update
+        set refresh_token_ciphertext = excluded.refresh_token_ciphertext,
+            updated_at = now()
+      `;
+    }
     await transaction`
       delete from private.gmail_oauth_tokens
       where connection_id = ${input.connectionId}
@@ -263,7 +306,64 @@ export async function disconnectMailbox(input: {
         'gmail.disconnected',
         'gmail_connection',
         ${input.connectionId},
-        ${transaction.json({ provider_revocation: input.revocationOutcome })}
+        ${
+      transaction.json({
+        provider_revocation: refreshTokenCiphertext
+          ? "pending"
+          : "token_missing",
+      })
+    }
+      )
+    `;
+  });
+}
+
+export async function pendingRevocationToken(
+  connectionId: string,
+): Promise<string | null> {
+  const rows = await database()<{
+    refresh_token_ciphertext: string;
+  }[]>`
+    update private.gmail_token_revocations
+    set last_attempt_at = now(),
+        updated_at = now()
+    where connection_id = ${connectionId}
+    returning refresh_token_ciphertext
+  `;
+  if (!rows[0]) return null;
+  const decrypted = await decryptJson<{ refreshToken: string }>(
+    rows[0].refresh_token_ciphertext,
+  );
+  return decrypted.refreshToken;
+}
+
+export async function completeRevocationCleanup(input: {
+  connectionId: string;
+  organizationId: string;
+  userId: string;
+}): Promise<void> {
+  await database().begin(async (transaction) => {
+    const deleted = await transaction<{ connection_id: string }[]>`
+      delete from private.gmail_token_revocations
+      where connection_id = ${input.connectionId}
+      returning connection_id
+    `;
+    if (!deleted[0]) return;
+    await transaction`
+      insert into public.audit_events (
+        organization_id,
+        actor_user_id,
+        event_type,
+        target_type,
+        target_id,
+        metadata
+      ) values (
+        ${input.organizationId},
+        ${input.userId},
+        'gmail.provider_access_revoked',
+        'gmail_connection',
+        ${input.connectionId},
+        ${transaction.json({ provider_revocation: "revoked" })}
       )
     `;
   });

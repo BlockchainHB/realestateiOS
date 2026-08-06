@@ -1,5 +1,6 @@
 import { sha256Hex } from "./crypto.ts";
 import { database } from "./database.ts";
+import { HttpError } from "./http.ts";
 import type { NormalizedEmail } from "./parser.ts";
 import { parsePaymentNotification } from "./parser.ts";
 
@@ -14,6 +15,22 @@ export async function ingestEmailSourceEvent(input: {
   const sql = database();
 
   return await sql.begin(async (transaction) => {
+    const activeConnections = await transaction<{ id: string }[]>`
+      select id
+      from public.gmail_connections
+      where id = ${input.connectionId}
+        and organization_id = ${input.organizationId}
+        and status <> 'disconnected'
+      for key share
+    `;
+    if (!activeConnections[0]) {
+      throw new HttpError(
+        409,
+        "gmail_not_connected",
+        "The Gmail connection was disconnected before intake completed.",
+      );
+    }
+
     const events = await transaction<{ id: string }[]>`
       insert into public.payment_source_events (
         organization_id,

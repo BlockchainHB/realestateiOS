@@ -282,6 +282,14 @@ create table private.gmail_oauth_tokens (
   updated_at timestamptz not null default now()
 );
 
+create table private.gmail_token_revocations (
+  connection_id uuid primary key references public.gmail_connections (id) on delete cascade,
+  refresh_token_ciphertext text not null,
+  created_at timestamptz not null default now(),
+  last_attempt_at timestamptz,
+  updated_at timestamptz not null default now()
+);
+
 create table private.gmail_notification_receipts (
   pubsub_message_id text primary key,
   connection_id uuid references public.gmail_connections (id) on delete set null,
@@ -296,5 +304,7 @@ comment on table public.payment_source_events is
   'Immutable Gmail-derived intake facts. A source event is never a ledger payment.';
 comment on table private.gmail_oauth_tokens is
   'Application-encrypted OAuth token bundles. Accessible only through a direct server database connection.';
+comment on table private.gmail_token_revocations is
+  'Application-encrypted refresh tokens retained only while provider revocation needs a retry.';
 comment on column public.audit_events.metadata is
   'Non-secret structured audit context. Tokens, message bodies, and provider credentials are prohibited.';

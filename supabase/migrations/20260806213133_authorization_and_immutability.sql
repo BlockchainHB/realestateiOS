@@ -323,6 +323,8 @@ alter table private.gmail_oauth_authorization_states enable row level security;
 alter table private.gmail_oauth_authorization_states force row level security;
 alter table private.gmail_oauth_tokens enable row level security;
 alter table private.gmail_oauth_tokens force row level security;
+alter table private.gmail_token_revocations enable row level security;
+alter table private.gmail_token_revocations force row level security;
 alter table private.gmail_notification_receipts enable row level security;
 alter table private.gmail_notification_receipts force row level security;
 

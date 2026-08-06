@@ -88,25 +88,37 @@ export async function loadToken(
 export async function saveToken(
   connectionId: string,
   bundle: GoogleTokenBundle,
-): Promise<void> {
-  const sql = database();
+  sql = database(),
+): Promise<boolean> {
   const ciphertext = await encryptJson(bundle);
-  await sql`
-    insert into private.gmail_oauth_tokens (
-      connection_id,
-      token_ciphertext,
-      access_token_expires_at,
-      granted_scopes
-    ) values (
-      ${connectionId},
-      ${ciphertext},
-      ${bundle.expiresAt},
-      ${bundle.scopes}
-    )
-    on conflict (connection_id) do update
-    set token_ciphertext = excluded.token_ciphertext,
-        access_token_expires_at = excluded.access_token_expires_at,
-        granted_scopes = excluded.granted_scopes,
-        updated_at = now()
-  `;
+  return await sql.begin(async (transaction) => {
+    const activeConnections = await transaction<{ id: string }[]>`
+      select id
+      from public.gmail_connections
+      where id = ${connectionId}
+        and status <> 'disconnected'
+      for update
+    `;
+    if (!activeConnections[0]) return false;
+
+    await transaction`
+      insert into private.gmail_oauth_tokens (
+        connection_id,
+        token_ciphertext,
+        access_token_expires_at,
+        granted_scopes
+      ) values (
+        ${connectionId},
+        ${ciphertext},
+        ${bundle.expiresAt},
+        ${bundle.scopes}
+      )
+      on conflict (connection_id) do update
+      set token_ciphertext = excluded.token_ciphertext,
+          access_token_expires_at = excluded.access_token_expires_at,
+          granted_scopes = excluded.granted_scopes,
+          updated_at = now()
+    `;
+    return true;
+  });
 }

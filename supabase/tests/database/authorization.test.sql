@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(47);
+select plan(50);
 
 insert into auth.users (
   instance_id,
@@ -166,7 +166,7 @@ select is((
   )
 ), 6::bigint, 'auth trigger creates one profile per fixture auth user');
 select is((select count(*) from pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' and relrowsecurity), 14::bigint, 'every public table has RLS enabled');
-select is((select count(*) from pg_class where relnamespace = 'private'::regnamespace and relkind = 'r' and relrowsecurity and relforcerowsecurity), 3::bigint, 'private tables force RLS');
+select is((select count(*) from pg_class where relnamespace = 'private'::regnamespace and relkind = 'r' and relrowsecurity and relforcerowsecurity), 4::bigint, 'private tables force RLS');
 
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000001', true);
@@ -250,7 +250,20 @@ select is(has_table_privilege('authenticated', 'public.gmail_connections', 'inse
 select is((select count(*) from pg_proc procedure join pg_namespace namespace on namespace.oid = procedure.pronamespace where namespace.nspname = 'public' and procedure.prosecdef), 0::bigint, 'no public SECURITY DEFINER functions exist');
 select is(has_function_privilege('public', 'private.is_organization_owner(uuid)', 'execute'), false, 'PUBLIC cannot execute private owner helper');
 select is(has_table_privilege('authenticated', 'private.gmail_oauth_tokens', 'select'), false, 'authenticated role has no token-table privilege');
+select is(has_table_privilege('authenticated', 'private.gmail_token_revocations', 'select'), false, 'authenticated role has no provider-cleanup credential access');
 select lives_ok($$insert into private.gmail_notification_receipts (pubsub_message_id, notified_history_id, outcome) values ('synthetic-pubsub-duplicate', '303', 'processing') on conflict (pubsub_message_id) do nothing; insert into private.gmail_notification_receipts (pubsub_message_id, notified_history_id, outcome) values ('synthetic-pubsub-duplicate', '303', 'processing') on conflict (pubsub_message_id) do nothing$$, 'duplicate Pub/Sub delivery is harmless');
+insert into private.gmail_notification_receipts (pubsub_message_id, notified_history_id, received_at, outcome)
+values ('synthetic-pubsub-stale', '404', now() - interval '6 minutes', 'processing');
+select results_eq(
+  $$insert into private.gmail_notification_receipts (pubsub_message_id, notified_history_id, outcome) values ('synthetic-pubsub-stale', '405', 'processing') on conflict (pubsub_message_id) do update set notified_history_id = excluded.notified_history_id, received_at = now(), processed_at = null, outcome = 'processing', error_code = null where private.gmail_notification_receipts.outcome = 'failed' or (private.gmail_notification_receipts.outcome = 'processing' and private.gmail_notification_receipts.received_at <= now() - interval '5 minutes') returning pubsub_message_id$$,
+  array['synthetic-pubsub-stale'::text],
+  'an abandoned Pub/Sub processing receipt is reclaimable after its lease'
+);
+select is(
+  (select notified_history_id from private.gmail_notification_receipts where pubsub_message_id = 'synthetic-pubsub-stale'),
+  '405',
+  'reclaiming an abandoned Pub/Sub receipt keeps the newest history cursor'
+);
 
 select * from finish();
 rollback;

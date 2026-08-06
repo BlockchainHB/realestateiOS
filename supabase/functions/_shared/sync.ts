@@ -43,7 +43,13 @@ export async function freshConnectionToken(
   if (Date.parse(bundle.expiresAt) > Date.now() + 120_000) return bundle;
   try {
     const refreshed = await refreshGoogleToken(bundle);
-    await saveToken(connectionId, refreshed);
+    if (!await saveToken(connectionId, refreshed)) {
+      throw new HttpError(
+        409,
+        "gmail_not_connected",
+        "The Gmail connection was disconnected while access was refreshing.",
+      );
+    }
     return refreshed;
   } catch (error) {
     await database()`
@@ -52,6 +58,7 @@ export async function freshConnectionToken(
           needs_reauthorization_at = now(),
           last_error_code = 'token_refresh_failed'
       where id = ${connectionId}
+        and status <> 'disconnected'
     `;
     throw error;
   }

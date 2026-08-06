@@ -1,5 +1,7 @@
 import { assertEquals, assertMatch } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.9";
+import { claimNotificationReceipt } from "../_shared/notification-receipts.ts";
+import { saveToken } from "../_shared/token-store.ts";
 
 const databaseUrl = Deno.env.get("SUPABASE_DB_URL");
 if (!databaseUrl) throw new Error("SUPABASE_DB_URL is required");
@@ -122,6 +124,123 @@ Deno.test("concurrent owner revocations retain one active owner", async () => {
     await sql`delete from auth.users where id = ${secondUserId}`.catch(
       () => undefined,
     );
+    await sql.end();
+  }
+});
+
+Deno.test("disconnect wins against in-flight refreshed token persistence", async () => {
+  const sql = postgres(databaseUrl, { max: 3 });
+  const connectionId = "f8000000-0000-0000-0000-000000000001";
+  const organizationId = "f1000000-0000-0000-0000-000000000001";
+  const userId = "f0000000-0000-0000-0000-000000000001";
+  Deno.env.set(
+    "GMAIL_TOKEN_ENCRYPTION_KEY",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+
+  try {
+    await sql`
+      insert into public.gmail_connections (
+        id, organization_id, provider_account_id, inbox_email, connected_by
+      ) values (
+        ${connectionId}, ${organizationId}, 'race@example.test',
+        'race@example.test', ${userId}
+      )
+      on conflict (organization_id) do update
+      set status = 'connected', disconnected_at = null
+    `;
+
+    let releaseDisconnect!: () => void;
+    const holdDisconnect = new Promise<void>((resolve) => {
+      releaseDisconnect = resolve;
+    });
+    let disconnectedInTransaction!: () => void;
+    const disconnectHasLock = new Promise<void>((resolve) => {
+      disconnectedInTransaction = resolve;
+    });
+
+    const disconnect = sql.begin(async (transaction) => {
+      await transaction`
+        select id
+        from public.gmail_connections
+        where id = ${connectionId}
+        for update
+      `;
+      await transaction`
+        delete from private.gmail_oauth_tokens
+        where connection_id = ${connectionId}
+      `;
+      await transaction`
+        update public.gmail_connections
+        set status = 'disconnected', disconnected_at = now()
+        where id = ${connectionId}
+      `;
+      disconnectedInTransaction();
+      await holdDisconnect;
+    });
+    await disconnectHasLock;
+
+    let persistenceSettled = false;
+    const persistence = saveToken(connectionId, {
+      accessToken: "synthetic-refreshed-access",
+      refreshToken: "synthetic-refresh",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    }, sql).then((saved) => {
+      persistenceSettled = true;
+      return saved;
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assertEquals(persistenceSettled, false);
+    releaseDisconnect();
+    await disconnect;
+    assertEquals(await persistence, false);
+    const tokens = await sql<{ count: number }[]>`
+      select count(*)::integer as count
+      from private.gmail_oauth_tokens
+      where connection_id = ${connectionId}
+    `;
+    assertEquals(tokens[0]?.count, 0);
+  } finally {
+    await sql`
+      delete from private.gmail_oauth_tokens where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_connections where id = ${connectionId}
+    `.catch(() => undefined);
+    await sql.end();
+  }
+});
+
+Deno.test("abandoned Pub/Sub processing receipts are reclaimed once", async () => {
+  const sql = postgres(databaseUrl, { max: 2 });
+  const messageId = "synthetic-concurrency-stale-receipt";
+  try {
+    await sql`
+      insert into private.gmail_notification_receipts (
+        pubsub_message_id, notified_history_id, received_at, outcome
+      ) values (
+        ${messageId}, '501', now() - interval '6 minutes', 'processing'
+      )
+      on conflict (pubsub_message_id) do update
+      set notified_history_id = excluded.notified_history_id,
+          received_at = excluded.received_at,
+          outcome = excluded.outcome
+    `;
+    assertEquals(await claimNotificationReceipt(messageId, "502", sql), true);
+    assertEquals(await claimNotificationReceipt(messageId, "503", sql), false);
+    const receipts = await sql<{ notified_history_id: string }[]>`
+      select notified_history_id
+      from private.gmail_notification_receipts
+      where pubsub_message_id = ${messageId}
+    `;
+    assertEquals(receipts[0]?.notified_history_id, "502");
+  } finally {
+    await sql`
+      delete from private.gmail_notification_receipts
+      where pubsub_message_id = ${messageId}
+    `.catch(() => undefined);
     await sql.end();
   }
 });

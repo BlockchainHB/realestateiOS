@@ -3,6 +3,7 @@ import { withSupabase } from "@supabase/server";
 import { connectedMailboxesByEmail } from "../_shared/connections.ts";
 import { database } from "../_shared/database.ts";
 import { errorResponse, HttpError, requireMethod } from "../_shared/http.ts";
+import { claimNotificationReceipt } from "../_shared/notification-receipts.ts";
 import {
   readPubSubNotification,
   verifyPubSubBearer,
@@ -18,24 +19,12 @@ export default {
       const notification = await readPubSubNotification(request);
       receiptId = notification.pubsubMessageId;
       const sql = database();
-      const claimed = await sql<{ pubsub_message_id: string }[]>`
-        insert into private.gmail_notification_receipts (
-          pubsub_message_id,
-          notified_history_id,
-          outcome
-        ) values (
-          ${notification.pubsubMessageId},
-          ${notification.historyId},
-          'processing'
+      if (
+        !await claimNotificationReceipt(
+          notification.pubsubMessageId,
+          notification.historyId,
         )
-        on conflict (pubsub_message_id) do update
-        set received_at = now(),
-            outcome = 'processing',
-            error_code = null
-        where private.gmail_notification_receipts.outcome = 'failed'
-        returning pubsub_message_id
-      `;
-      if (!claimed[0]) return new Response(null, { status: 204 });
+      ) return new Response(null, { status: 204 });
 
       const connections = await connectedMailboxesByEmail(
         notification.emailAddress,

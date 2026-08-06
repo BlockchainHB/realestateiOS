@@ -2,8 +2,10 @@ import "@supabase/functions-js/edge-runtime.d.ts";
 import { withSupabase } from "@supabase/server";
 import { requireOrganizationOwner } from "../_shared/authorization.ts";
 import {
+  completeRevocationCleanup,
   disconnectMailbox,
   organizationConnection,
+  pendingRevocationToken,
 } from "../_shared/connections.ts";
 import { database } from "../_shared/database.ts";
 import {
@@ -12,7 +14,7 @@ import {
   jsonResponse,
   readJson,
 } from "../_shared/http.ts";
-import { disconnectGoogleAccess } from "../_shared/oauth.ts";
+import { disconnectGoogleAccess, revokeGoogleToken } from "../_shared/oauth.ts";
 import { loadToken } from "../_shared/token-store.ts";
 
 export default {
@@ -63,30 +65,52 @@ export default {
         const connection = await organizationConnection(body.organizationId);
         if (!connection) return jsonResponse({ disconnected: true });
         const bundle = await loadToken(connection.id);
-        let revocationOutcome = "token_missing";
+        if (connection.status !== "disconnected" || bundle) {
+          await disconnectMailbox({
+            connectionId: connection.id,
+            organizationId: body.organizationId,
+            userId,
+            refreshToken: bundle?.refreshToken ?? null,
+          });
+        }
+
+        let revocationConfirmed = false;
         if (bundle) {
           const outcome = await disconnectGoogleAccess(bundle);
-          revocationOutcome = outcome.revocation;
           if (outcome.tokenRefreshFailed || outcome.watchStopFailed) {
             console.error("Google watch shutdown was incomplete", {
               token_refresh_failed: outcome.tokenRefreshFailed,
               watch_stop_failed: outcome.watchStopFailed,
             });
           }
-          if (outcome.revocation === "provider_unreachable") {
-            console.error("Google grant revocation was not confirmed");
-            throw new HttpError(
-              502,
-              "google_revocation_failed",
-              "Google access could not be revoked. The connection remains available for retry.",
-            );
+          revocationConfirmed = outcome.revocation === "revoked";
+        } else {
+          const pendingRefreshToken = await pendingRevocationToken(
+            connection.id,
+          );
+          if (pendingRefreshToken) {
+            try {
+              await revokeGoogleToken(pendingRefreshToken);
+              revocationConfirmed = true;
+            } catch {
+              revocationConfirmed = false;
+            }
+          } else {
+            return jsonResponse({ disconnected: true });
           }
         }
-        await disconnectMailbox({
+        if (!revocationConfirmed) {
+          console.error("Google grant revocation was not confirmed");
+          throw new HttpError(
+            502,
+            "google_revocation_failed",
+            "The mailbox is disconnected locally, but Google revocation still needs a retry.",
+          );
+        }
+        await completeRevocationCleanup({
           connectionId: connection.id,
           organizationId: body.organizationId,
           userId,
-          revocationOutcome,
         });
         return jsonResponse({ disconnected: true });
       }
