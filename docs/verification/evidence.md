@@ -18,7 +18,7 @@ Recorded on 2026-08-06 against branch `hasaam/supabase-google-oauth-foundation`.
 | Database authorization | `supabase test db` | Pass; 43 pgTAP assertions. |
 | Schema lint | `supabase db lint --local --schema public,private --level warning --fail-on error` | Pass; no schema errors in the application-owned schemas. The extension schema is excluded because pgTAP's own compatibility warnings are not application code. |
 | Security advisor | `supabase db advisors --local --type security --level info --fail-on error` | Pass; no error-level findings. The three informational no-policy findings are the intentionally inaccessible, forced-RLS tables in the non-exposed `private` schema. |
-| Performance advisor | `supabase db advisors --local --type performance --level info --fail-on error` | Pass at the error threshold. Informational foreign-key and unused-index suggestions remain candidates for measurement when production query shapes exist. |
+| Performance advisor | `supabase db advisors --local --type performance --level info --fail-on error` | Pass at the error threshold; no unindexed foreign keys remain. A freshly reset database reports the new and query-path indexes as unused until representative traffic exists. |
 | Function formatting | `deno fmt --check supabase/functions` | Pass; 24 files checked. |
 | Function type checks | `deno check --config supabase/functions/<function>/deno.json supabase/functions/<function>/index.ts` | Pass for all five Edge Functions. |
 | Edge unit tests | `deno test --allow-env --allow-read=fixtures/gmail --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/parser_test.ts` | Pass; 8 tests. |
