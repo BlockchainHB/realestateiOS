@@ -11,7 +11,11 @@ import {
   pkceChallenge,
   randomToken,
 } from "../_shared/crypto.ts";
-import { buildGoogleAuthorizationUrl } from "../_shared/oauth.ts";
+import { preservedHistoryCursor } from "../_shared/connections.ts";
+import {
+  buildGoogleAuthorizationUrl,
+  disconnectGoogleAccess,
+} from "../_shared/oauth.ts";
 import type { NormalizedEmail } from "../_shared/parser.ts";
 import { parsePaymentNotification } from "../_shared/parser.ts";
 import { readPubSubNotification } from "../_shared/pubsub.ts";
@@ -140,4 +144,59 @@ Deno.test("maintenance secret comparison handles equal and unequal values", () =
     constantTimeEqual("synthetic-secret", "synthetic-secreu"),
     false,
   );
+});
+
+Deno.test("watch setup preserves an existing Gmail history cursor", () => {
+  assertEquals(preservedHistoryCursor("101", "999"), "101");
+  assertEquals(preservedHistoryCursor(null, "999"), "999");
+});
+
+Deno.test("Google grant revocation is attempted after refresh and watch failures", async () => {
+  Deno.env.set("GOOGLE_OAUTH_CLIENT_ID", "synthetic-client.apps.example.test");
+  Deno.env.set("GOOGLE_OAUTH_CLIENT_SECRET", "synthetic-test-value");
+  const requestedUrls: string[] = [];
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = ((input: string | URL | Request) => {
+    const url = typeof input === "string"
+      ? input
+      : input instanceof URL
+      ? input.toString()
+      : input.url;
+    requestedUrls.push(url);
+    if (url === "https://oauth2.googleapis.com/token") {
+      return Promise.resolve(Response.json({ error: "invalid_grant" }, {
+        status: 400,
+      }));
+    }
+    if (url.endsWith("/gmail/v1/users/me/stop")) {
+      return Promise.resolve(Response.json({ error: "expired" }, {
+        status: 401,
+      }));
+    }
+    if (url === "https://oauth2.googleapis.com/revoke") {
+      return Promise.resolve(new Response(null, { status: 200 }));
+    }
+    return Promise.reject(new Error(`Unexpected synthetic URL: ${url}`));
+  }) as typeof fetch;
+
+  try {
+    const outcome = await disconnectGoogleAccess({
+      accessToken: "synthetic-expired-access",
+      refreshToken: "synthetic-refresh",
+      expiresAt: new Date(0).toISOString(),
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    });
+    assertEquals(outcome, {
+      revocation: "revoked",
+      tokenRefreshFailed: true,
+      watchStopFailed: true,
+    });
+    assertEquals(requestedUrls, [
+      "https://oauth2.googleapis.com/token",
+      "https://gmail.googleapis.com/gmail/v1/users/me/stop",
+      "https://oauth2.googleapis.com/revoke",
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });

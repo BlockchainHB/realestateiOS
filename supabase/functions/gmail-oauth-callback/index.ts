@@ -1,12 +1,16 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { withSupabase } from "@supabase/server";
-import { connectMailbox } from "../_shared/connections.ts";
+import {
+  connectMailbox,
+  requireCompatibleMailbox,
+} from "../_shared/connections.ts";
 import { HttpError, jsonResponse } from "../_shared/http.ts";
 import {
   exchangeAuthorizationCode,
   readGoogleMailboxIdentity,
   startGmailWatch,
 } from "../_shared/oauth.ts";
+import { synchronizeConnection } from "../_shared/sync.ts";
 import { consumeAuthorizationState } from "../_shared/token-store.ts";
 
 function completionRedirect(
@@ -54,8 +58,12 @@ export default {
     try {
       const bundle = await exchangeAuthorizationCode(code, state.codeVerifier);
       const mailbox = await readGoogleMailboxIdentity(bundle);
+      await requireCompatibleMailbox(
+        state.organizationId,
+        mailbox.emailAddress,
+      );
       const watch = await startGmailWatch(bundle);
-      await connectMailbox({
+      const connectionId = await connectMailbox({
         organizationId: state.organizationId,
         userId: state.userId,
         providerAccountId: mailbox.emailAddress.toLowerCase(),
@@ -63,6 +71,13 @@ export default {
         bundle,
         watch,
       });
+      try {
+        await synchronizeConnection(connectionId, watch.historyId);
+      } catch (error) {
+        console.error("Gmail catch-up synchronization was delayed", {
+          code: error instanceof HttpError ? error.code : "sync_failed",
+        });
+      }
       return completionRedirect(state.returnUrl, "connected");
     } catch (error) {
       const code = error instanceof HttpError

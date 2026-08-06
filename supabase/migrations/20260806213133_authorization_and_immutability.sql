@@ -77,7 +77,8 @@ as $$
         and participant.tenancy_id = target_tenancy_id
         and participant.user_id = (select auth.uid())
         and participant.ended_at is null
-        and tenancy.ends_on is null
+        and tenancy.starts_on <= current_date
+        and (tenancy.ends_on is null or tenancy.ends_on >= current_date)
         and tenancy.archived_at is null
     );
 $$;
@@ -154,6 +155,21 @@ begin
 end;
 $$;
 
+create function private.prevent_gmail_connection_identity_change()
+returns trigger
+language plpgsql
+set search_path = ''
+as $$
+begin
+  if new.organization_id is distinct from old.organization_id
+     or new.provider_account_id is distinct from old.provider_account_id
+     or new.inbox_email is distinct from old.inbox_email then
+    raise exception 'Gmail connection identity is immutable' using errcode = '23514';
+  end if;
+  return new;
+end;
+$$;
+
 create function private.prevent_last_owner_removal()
 returns trigger
 language plpgsql
@@ -171,6 +187,11 @@ begin
   if tg_op = 'UPDATE' and new.revoked_at is null then
     return new;
   end if;
+
+  perform 1
+  from public.organizations organization
+  where organization.id = old.organization_id
+  for update;
 
   select count(*)
   into active_other_owners
@@ -208,6 +229,7 @@ revoke all on function private.set_updated_at() from public;
 revoke all on function private.prevent_organization_reassignment() from public;
 revoke all on function private.prevent_organization_creator_change() from public;
 revoke all on function private.prevent_membership_identity_change() from public;
+revoke all on function private.prevent_gmail_connection_identity_change() from public;
 revoke all on function private.prevent_last_owner_removal() from public;
 revoke all on function private.reject_immutable_mutation() from public;
 
@@ -252,6 +274,9 @@ create trigger memberships_prevent_identity_change
 create trigger memberships_prevent_last_owner_removal
   before update or delete on public.organization_memberships
   for each row execute function private.prevent_last_owner_removal();
+create trigger gmail_connections_prevent_identity_change
+  before update on public.gmail_connections
+  for each row execute function private.prevent_gmail_connection_identity_change();
 
 create trigger properties_prevent_organization_change
   before update on public.properties

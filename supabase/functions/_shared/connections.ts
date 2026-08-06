@@ -6,6 +6,7 @@ import type { GoogleTokenBundle } from "./oauth.ts";
 export interface GmailConnectionRow {
   id: string;
   organization_id: string;
+  provider_account_id: string;
   inbox_email: string;
   status:
     | "connected"
@@ -13,6 +14,30 @@ export interface GmailConnectionRow {
     | "sync_delayed"
     | "disconnected";
   last_successful_sync_at: string | null;
+}
+
+export function preservedHistoryCursor(
+  existingCursor: string | null | undefined,
+  watchCursor: string,
+): string {
+  return existingCursor ?? watchCursor;
+}
+
+export async function requireCompatibleMailbox(
+  organizationId: string,
+  providerAccountId: string,
+): Promise<void> {
+  const existing = await organizationConnection(organizationId);
+  if (
+    existing &&
+    existing.provider_account_id !== providerAccountId.toLowerCase()
+  ) {
+    throw new HttpError(
+      409,
+      "gmail_mailbox_replacement_not_allowed",
+      "Disconnecting does not replace the mailbox identity retained by payment source records.",
+    );
+  }
 }
 
 export async function connectMailbox(input: {
@@ -25,6 +50,8 @@ export async function connectMailbox(input: {
 }): Promise<string> {
   const sql = database();
   const tokenCiphertext = await encryptJson(input.bundle);
+  const providerAccountId = input.providerAccountId.toLowerCase();
+  const inboxEmail = input.inboxEmail.toLowerCase();
   return await sql.begin(async (transaction) => {
     const owners = await transaction<{ id: string }[]>`
       select id
@@ -43,6 +70,32 @@ export async function connectMailbox(input: {
       );
     }
 
+    const existingConnections = await transaction<{
+      provider_account_id: string;
+      last_history_id: string | null;
+    }[]>`
+      select connection.provider_account_id, state.last_history_id
+      from public.gmail_connections connection
+      left join public.gmail_sync_states state
+        on state.connection_id = connection.id
+      where connection.organization_id = ${input.organizationId}
+      for update of connection
+    `;
+    if (
+      existingConnections[0] &&
+      existingConnections[0].provider_account_id !== providerAccountId
+    ) {
+      throw new HttpError(
+        409,
+        "gmail_mailbox_replacement_not_allowed",
+        "Disconnecting does not replace the mailbox identity retained by payment source records.",
+      );
+    }
+    const historyCursor = preservedHistoryCursor(
+      existingConnections[0]?.last_history_id,
+      input.watch.historyId,
+    );
+
     const connections = await transaction<{ id: string }[]>`
       insert into public.gmail_connections (
         organization_id,
@@ -56,8 +109,8 @@ export async function connectMailbox(input: {
         last_error_code
       ) values (
         ${input.organizationId},
-        ${input.providerAccountId},
-        ${input.inboxEmail.toLowerCase()},
+        ${providerAccountId},
+        ${inboxEmail},
         'connected',
         ${input.userId},
         now(),
@@ -66,19 +119,22 @@ export async function connectMailbox(input: {
         null
       )
       on conflict (organization_id) do update
-      set provider_account_id = excluded.provider_account_id,
-          inbox_email = excluded.inbox_email,
-          status = 'connected',
+      set status = 'connected',
           connected_by = excluded.connected_by,
           connected_at = now(),
           disconnected_at = null,
           needs_reauthorization_at = null,
           last_error_code = null
+      where public.gmail_connections.provider_account_id = excluded.provider_account_id
       returning id
     `;
     const connectionId = connections[0]?.id;
     if (!connectionId) {
-      throw new Error("Gmail connection upsert returned no identifier");
+      throw new HttpError(
+        409,
+        "gmail_mailbox_replacement_not_allowed",
+        "Disconnecting does not replace the mailbox identity retained by payment source records.",
+      );
     }
 
     await transaction`
@@ -111,14 +167,17 @@ export async function connectMailbox(input: {
       ) values (
         ${connectionId},
         ${input.organizationId},
-        ${input.watch.historyId},
+        ${historyCursor},
         to_timestamp(${input.watch.expiration}::numeric / 1000),
         'idle',
         0
       )
       on conflict (connection_id) do update
       set organization_id = excluded.organization_id,
-          last_history_id = excluded.last_history_id,
+          last_history_id = coalesce(
+            public.gmail_sync_states.last_history_id,
+            excluded.last_history_id
+          ),
           watch_expiration = excluded.watch_expiration,
           status = 'idle',
           consecutive_failures = 0,
@@ -150,7 +209,8 @@ export async function organizationConnection(
   organizationId: string,
 ): Promise<GmailConnectionRow | null> {
   const rows = await database()<GmailConnectionRow[]>`
-    select id, organization_id, inbox_email, status, last_successful_sync_at
+    select id, organization_id, provider_account_id, inbox_email, status,
+           last_successful_sync_at
     from public.gmail_connections
     where organization_id = ${organizationId}
     limit 1
@@ -162,7 +222,8 @@ export async function connectedMailboxesByEmail(
   email: string,
 ): Promise<GmailConnectionRow[]> {
   return await database()<GmailConnectionRow[]>`
-    select id, organization_id, inbox_email, status, last_successful_sync_at
+    select id, organization_id, provider_account_id, inbox_email, status,
+           last_successful_sync_at
     from public.gmail_connections
     where inbox_email = ${email.toLowerCase()}
       and status <> 'disconnected'

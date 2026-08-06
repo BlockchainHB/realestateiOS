@@ -178,15 +178,12 @@ export async function renewConnectionWatch(
   const watch = await startGmailWatch(bundle);
   await database()`
     update public.gmail_sync_states
-    set last_history_id = case
-          when last_history_id is null then ${watch.historyId}
-          when ${watch.historyId}::numeric > last_history_id::numeric then ${watch.historyId}
-          else last_history_id
-        end,
+    set last_history_id = coalesce(last_history_id, ${watch.historyId}),
         watch_expiration = to_timestamp(${watch.expiration}::numeric / 1000),
         status = 'idle',
         consecutive_failures = 0,
         updated_at = now()
     where connection_id = ${connectionId}
   `;
+  await synchronizeConnection(connectionId, watch.historyId);
 }

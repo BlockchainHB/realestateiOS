@@ -12,7 +12,7 @@ import {
   jsonResponse,
   readJson,
 } from "../_shared/http.ts";
-import { revokeGoogleToken, stopGmailWatch } from "../_shared/oauth.ts";
+import { disconnectGoogleAccess } from "../_shared/oauth.ts";
 import { loadToken } from "../_shared/token-store.ts";
 
 export default {
@@ -65,15 +65,21 @@ export default {
         const bundle = await loadToken(connection.id);
         let revocationOutcome = "token_missing";
         if (bundle) {
-          try {
-            await stopGmailWatch(bundle);
-            await revokeGoogleToken(bundle.refreshToken);
-            revocationOutcome = "revoked";
-          } catch (error) {
-            revocationOutcome = "provider_unreachable";
-            console.error("Google revocation failed during local disconnect", {
-              code: error instanceof HttpError ? error.code : "unknown",
+          const outcome = await disconnectGoogleAccess(bundle);
+          revocationOutcome = outcome.revocation;
+          if (outcome.tokenRefreshFailed || outcome.watchStopFailed) {
+            console.error("Google watch shutdown was incomplete", {
+              token_refresh_failed: outcome.tokenRefreshFailed,
+              watch_stop_failed: outcome.watchStopFailed,
             });
+          }
+          if (outcome.revocation === "provider_unreachable") {
+            console.error("Google grant revocation was not confirmed");
+            throw new HttpError(
+              502,
+              "google_revocation_failed",
+              "Google access could not be revoked. The connection remains available for retry.",
+            );
           }
         }
         await disconnectMailbox({

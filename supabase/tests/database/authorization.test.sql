@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(43);
+select plan(47);
 
 insert into auth.users (
   instance_id,
@@ -192,6 +192,30 @@ select throws_like($$insert into public.gmail_connections (organization_id, prov
 select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000003', true);
 select results_eq('select count(*) from public.organizations', array[1::bigint], 'tenant sees their organization context');
 select results_eq('select count(*) from public.tenancies', array[1::bigint], 'active tenant sees their tenancy');
+reset role;
+update public.tenancies
+set starts_on = current_date - 1,
+    ends_on = current_date + 1
+where id = '60000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000003', true);
+select results_eq('select count(*) from public.tenancies', array[1::bigint], 'tenant sees a bounded tenancy during its effective dates');
+reset role;
+update public.tenancies
+set starts_on = current_date + 1,
+    ends_on = current_date + 2
+where id = '60000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000003', true);
+select results_eq('select count(*) from public.tenancies', array[0::bigint], 'tenant cannot see a tenancy before its effective start');
+reset role;
+update public.tenancies
+set starts_on = current_date - 2,
+    ends_on = current_date - 1
+where id = '60000000-0000-0000-0000-000000000001';
+set local role authenticated;
+select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000003', true);
+select results_eq('select count(*) from public.tenancies', array[0::bigint], 'tenant cannot see a tenancy after its effective end');
 select results_eq('select count(*) from public.gmail_connections', array[0::bigint], 'tenant cannot see Gmail connections');
 select results_eq('select count(*) from public.payment_source_events', array[0::bigint], 'tenant cannot see source events');
 
@@ -215,6 +239,7 @@ select throws_like($$insert into public.payer_tenancy_mappings (organization_id,
 select throws_like('select count(*) from private.gmail_oauth_tokens', '%permission denied%', 'manager cannot read private OAuth tokens');
 
 reset role;
+select throws_like($$update public.gmail_connections set provider_account_id = 'replacement@example.test', inbox_email = 'replacement@example.test' where id = '80000000-0000-0000-0000-000000000001'$$, '%Gmail connection identity is immutable%', 'retained Gmail connection identity cannot be replaced');
 select throws_like($$insert into public.payment_source_events (organization_id, connection_id, provider_message_id, event_type, parse_outcome, parser_version, content_sha256) values ('20000000-0000-0000-0000-000000000001', '80000000-0000-0000-0000-000000000001', 'synthetic-message-1', 'deposit_completed', 'unsupported', 'synthetic-interac-v1', repeat('d', 64))$$, '%duplicate key%', 'duplicate provider message identity is rejected');
 select throws_like($$update public.payment_source_events set parser_version = 'changed' where id = '90000000-0000-0000-0000-000000000001'$$, '%append-only%', 'source events are immutable');
 select throws_like($$delete from public.payment_source_events where id = '90000000-0000-0000-0000-000000000001'$$, '%append-only%', 'source events cannot be deleted');

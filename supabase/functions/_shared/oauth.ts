@@ -194,3 +194,41 @@ export async function startGmailWatch(bundle: GoogleTokenBundle): Promise<{
 export async function stopGmailWatch(bundle: GoogleTokenBundle): Promise<void> {
   await gmailApi(bundle, "/stop", { method: "POST", body: "{}" });
 }
+
+export interface GoogleDisconnectOutcome {
+  revocation: "revoked" | "provider_unreachable";
+  tokenRefreshFailed: boolean;
+  watchStopFailed: boolean;
+}
+
+export async function disconnectGoogleAccess(
+  bundle: GoogleTokenBundle,
+): Promise<GoogleDisconnectOutcome> {
+  let accessBundle = bundle;
+  let tokenRefreshFailed = false;
+  if (Date.parse(bundle.expiresAt) <= Date.now() + 120_000) {
+    try {
+      accessBundle = await refreshGoogleToken(bundle);
+    } catch {
+      tokenRefreshFailed = true;
+    }
+  }
+
+  let watchStopFailed = false;
+  try {
+    await stopGmailWatch(accessBundle);
+  } catch {
+    watchStopFailed = true;
+  }
+
+  try {
+    await revokeGoogleToken(bundle.refreshToken);
+    return { revocation: "revoked", tokenRefreshFailed, watchStopFailed };
+  } catch {
+    return {
+      revocation: "provider_unreachable",
+      tokenRefreshFailed,
+      watchStopFailed,
+    };
+  }
+}
