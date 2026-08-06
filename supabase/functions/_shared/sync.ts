@@ -121,7 +121,17 @@ export async function synchronizeConnection(
 
     let processed = 0;
     for (const messageId of messageIds) {
-      const email = await getNormalizedEmail(bundle, messageId);
+      let email: Awaited<ReturnType<typeof getNormalizedEmail>>;
+      try {
+        email = await getNormalizedEmail(bundle, messageId);
+      } catch (error) {
+        if (
+          error instanceof HttpError && error.code === "gmail_message_not_found"
+        ) {
+          continue;
+        }
+        throw error;
+      }
       const outcome = await ingestEmailSourceEvent({
         connectionId,
         organizationId: connection.organization_id,
@@ -149,6 +159,7 @@ export async function synchronizeConnection(
           last_successful_sync_at = now(),
           last_error_code = null
       where id = ${connectionId}
+        and status <> 'disconnected'
     `;
     return { processed, cursor };
   } catch (error) {
@@ -166,6 +177,7 @@ export async function synchronizeConnection(
       error instanceof HttpError ? error.code : "sync_failed"
     }
       where id = ${connectionId}
+        and status <> 'disconnected'
     `;
     throw error;
   }

@@ -50,6 +50,11 @@ export async function getNormalizedEmail(
   const message = await gmailApi<GmailMessage>(
     bundle,
     `/messages/${encodeURIComponent(messageId)}?format=full`,
+    {},
+    {
+      notFoundCode: "gmail_message_not_found",
+      notFoundMessage: "The Gmail message is no longer available.",
+    },
   );
   const headers = collectHeaders(message.payload?.headers);
   const internalDate = message.internalDate

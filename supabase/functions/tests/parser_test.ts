@@ -12,6 +12,8 @@ import {
   randomToken,
 } from "../_shared/crypto.ts";
 import { preservedHistoryCursor } from "../_shared/connections.ts";
+import { getNormalizedEmail } from "../_shared/gmail-message.ts";
+import { HttpError } from "../_shared/http.ts";
 import {
   buildGoogleAuthorizationUrl,
   disconnectGoogleAccess,
@@ -149,6 +151,35 @@ Deno.test("maintenance secret comparison handles equal and unequal values", () =
 Deno.test("watch setup preserves an existing Gmail history cursor", () => {
   assertEquals(preservedHistoryCursor("101", "999"), "101");
   assertEquals(preservedHistoryCursor(null, "999"), "999");
+});
+
+Deno.test("permanently unavailable Gmail messages have a skippable error identity", async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (() =>
+    Promise.resolve(
+      Response.json({ error: "not_found" }, { status: 404 }),
+    )) as typeof fetch;
+
+  try {
+    let caught: unknown;
+    try {
+      await getNormalizedEmail({
+        accessToken: "synthetic-access",
+        refreshToken: "synthetic-refresh",
+        expiresAt: new Date(Date.now() + 60_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      }, "permanently-deleted-message");
+    } catch (error) {
+      caught = error;
+    }
+    assertEquals(caught instanceof HttpError, true);
+    if (caught instanceof HttpError) {
+      assertEquals(caught.status, 404);
+      assertEquals(caught.code, "gmail_message_not_found");
+    }
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 Deno.test("Google grant revocation is attempted after refresh and watch failures", async () => {

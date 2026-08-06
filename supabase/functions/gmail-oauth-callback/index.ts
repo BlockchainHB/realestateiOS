@@ -6,7 +6,9 @@ import {
 } from "../_shared/connections.ts";
 import { HttpError, jsonResponse } from "../_shared/http.ts";
 import {
+  disconnectGoogleAccess,
   exchangeAuthorizationCode,
+  type GoogleTokenBundle,
   readGoogleMailboxIdentity,
   startGmailWatch,
 } from "../_shared/oauth.ts";
@@ -55,22 +57,25 @@ export default {
       );
     }
 
+    let issuedBundle: GoogleTokenBundle | null = null;
+    let connectionStored = false;
     try {
-      const bundle = await exchangeAuthorizationCode(code, state.codeVerifier);
-      const mailbox = await readGoogleMailboxIdentity(bundle);
+      issuedBundle = await exchangeAuthorizationCode(code, state.codeVerifier);
+      const mailbox = await readGoogleMailboxIdentity(issuedBundle);
       await requireCompatibleMailbox(
         state.organizationId,
         mailbox.emailAddress,
       );
-      const watch = await startGmailWatch(bundle);
+      const watch = await startGmailWatch(issuedBundle);
       const connectionId = await connectMailbox({
         organizationId: state.organizationId,
         userId: state.userId,
         providerAccountId: mailbox.emailAddress.toLowerCase(),
         inboxEmail: mailbox.emailAddress,
-        bundle,
+        bundle: issuedBundle,
         watch,
       });
+      connectionStored = true;
       try {
         await synchronizeConnection(connectionId, watch.historyId);
       } catch (error) {
@@ -80,6 +85,14 @@ export default {
       }
       return completionRedirect(state.returnUrl, "connected");
     } catch (error) {
+      if (issuedBundle && !connectionStored) {
+        const cleanup = await disconnectGoogleAccess(issuedBundle);
+        console.error("Failed Gmail authorization cleanup was attempted", {
+          provider_revocation: cleanup.revocation,
+          token_refresh_failed: cleanup.tokenRefreshFailed,
+          watch_stop_failed: cleanup.watchStopFailed,
+        });
+      }
       const code = error instanceof HttpError
         ? error.code
         : "gmail_connection_failed";

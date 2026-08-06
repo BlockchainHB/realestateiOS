@@ -142,6 +142,7 @@ export async function gmailApi<T>(
   bundle: GoogleTokenBundle,
   path: string,
   init: RequestInit = {},
+  errors: { notFoundCode?: string; notFoundMessage?: string } = {},
 ): Promise<T> {
   const response = await fetch(
     `https://gmail.googleapis.com/gmail/v1/users/me${path}`,
@@ -155,6 +156,13 @@ export async function gmailApi<T>(
     },
   );
   if (!response.ok) {
+    if (response.status === 404 && errors.notFoundCode) {
+      throw new HttpError(
+        404,
+        errors.notFoundCode,
+        errors.notFoundMessage ?? "The Gmail resource is no longer available.",
+      );
+    }
     const code = response.status === 401
       ? "gmail_reauthorization_required"
       : "gmail_api_failed";
