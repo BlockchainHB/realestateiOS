@@ -63,16 +63,13 @@ export default {
         const userId = await requireOrganizationOwner(ctx, body.organizationId);
         const connection = await organizationConnection(body.organizationId);
         if (!connection) return jsonResponse({ disconnected: true });
-        const disconnected = connection.status !== "disconnected"
-          ? await disconnectMailbox({
-            connectionId: connection.id,
-            organizationId: body.organizationId,
-            userId,
-          })
-          : null;
-        const bundle = disconnected?.bundle ?? null;
-        const providerCleanupRequired = disconnected?.providerCleanupRequired ??
-          true;
+        const disconnected = await disconnectMailbox({
+          connectionId: connection.id,
+          organizationId: body.organizationId,
+          userId,
+        });
+        const bundle = disconnected.bundle;
+        const providerCleanupRequired = disconnected.providerCleanupRequired;
         if (!providerCleanupRequired) {
           return jsonResponse({ disconnected: true });
         }

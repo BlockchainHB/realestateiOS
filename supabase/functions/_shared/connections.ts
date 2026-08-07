@@ -333,6 +333,11 @@ export async function disconnectMailbox(input: {
       from private.gmail_oauth_tokens
       where connection_id = ${input.connectionId}
     `;
+    const pendingRevocations = await transaction<{ connection_id: string }[]>`
+      select connection_id
+      from private.gmail_token_revocations
+      where connection_id = ${input.connectionId}
+    `;
     const bundle = tokenRows[0]
       ? await decryptJson<GoogleTokenBundle>(tokenRows[0].token_ciphertext)
       : null;
@@ -343,10 +348,10 @@ export async function disconnectMailbox(input: {
       connection.id !== input.connectionId &&
       connection.status !== "disconnected"
     );
-    const providerCleanupRequired = Boolean(
-      refreshTokenCiphertext && !otherActiveConnection,
+    const providerCleanupRequired = !otherActiveConnection && Boolean(
+      refreshTokenCiphertext || pendingRevocations[0],
     );
-    if (providerCleanupRequired) {
+    if (refreshTokenCiphertext && !otherActiveConnection) {
       await transaction`
         insert into private.gmail_token_revocations (
           connection_id,

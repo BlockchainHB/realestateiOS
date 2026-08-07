@@ -754,3 +754,120 @@ Deno.test("disconnect retains the reauthorized bundle under the provider lock", 
     await sql.end();
   }
 });
+
+Deno.test("disconnect rechecks a stale disconnected snapshot under the provider lock", async () => {
+  const sql = postgres(databaseUrl, { max: 3 });
+  const connectionId = "f8000000-0000-0000-0000-000000000032";
+  const organizationId = "f1000000-0000-0000-0000-000000000001";
+  const ownerId = "f0000000-0000-0000-0000-000000000001";
+  const providerAccountId = "stale-disconnect-snapshot@example.test";
+  Deno.env.set(
+    "GMAIL_TOKEN_ENCRYPTION_KEY",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+
+  try {
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from public.gmail_sync_states
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      delete from public.gmail_connections
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      insert into public.gmail_connections (
+        id, organization_id, provider_account_id, inbox_email, connected_by,
+        status, disconnected_at
+      ) values (
+        ${connectionId}, ${organizationId}, ${providerAccountId},
+        ${providerAccountId}, ${ownerId}, 'disconnected', now()
+      )
+    `;
+    await sql`
+      insert into public.gmail_sync_states (
+        connection_id, organization_id, last_history_id, watch_expiration
+      ) values (
+        ${connectionId}, ${organizationId}, '971', now() + interval '1 day'
+      )
+    `;
+
+    const staleSnapshot = await sql<{ status: string }[]>`
+      select status
+      from public.gmail_connections
+      where id = ${connectionId}
+    `;
+    assertEquals(staleSnapshot[0]?.status, "disconnected");
+
+    const currentBundle = {
+      accessToken: "synthetic-current-access",
+      refreshToken: "synthetic-current-refresh",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    };
+    await connectMailbox({
+      organizationId,
+      userId: ownerId,
+      providerAccountId,
+      inboxEmail: providerAccountId,
+      bundle: currentBundle,
+      startWatch: () =>
+        Promise.resolve({
+          historyId: "972",
+          expiration: "1893456000000",
+        }),
+    }, sql);
+
+    const disconnected = await disconnectMailbox({
+      connectionId,
+      organizationId,
+      userId: ownerId,
+    }, sql);
+    assertEquals(disconnected.providerCleanupRequired, true);
+    assertEquals(disconnected.bundle, currentBundle);
+    const finalConnections = await sql<{ status: string }[]>`
+      select status
+      from public.gmail_connections
+      where id = ${connectionId}
+    `;
+    assertEquals(finalConnections[0]?.status, "disconnected");
+    const storedTokens = await sql<{ count: number }[]>`
+      select count(*)::integer as count
+      from private.gmail_oauth_tokens
+      where connection_id = ${connectionId}
+    `;
+    assertEquals(storedTokens[0]?.count, 0);
+  } finally {
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_sync_states
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_connections
+      where id = ${connectionId}
+    `.catch(() => undefined);
+    await sql.end();
+  }
+});
