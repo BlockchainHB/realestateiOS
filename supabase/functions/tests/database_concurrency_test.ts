@@ -286,6 +286,24 @@ Deno.test("shared mailbox provider cleanup waits for the final organization", as
         (${firstConnectionId}, ${firstOrganizationId}, ${providerAccountId}, ${providerAccountId}, ${ownerId}),
         (${secondConnectionId}, ${secondOrganizationId}, ${providerAccountId}, ${providerAccountId}, ${ownerId})
     `;
+    assertEquals(
+      await saveToken(firstConnectionId, {
+        accessToken: "synthetic-first-access",
+        refreshToken: "synthetic-first-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      }, sql),
+      true,
+    );
+    assertEquals(
+      await saveToken(secondConnectionId, {
+        accessToken: "synthetic-second-access",
+        refreshToken: "synthetic-final-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      }, sql),
+      true,
+    );
 
     let failedCallbackCleanupCalls = 0;
     const failedCallbackCleanup = await cleanupProviderAccessIfUnused(
@@ -303,7 +321,6 @@ Deno.test("shared mailbox provider cleanup waits for the final organization", as
       connectionId: firstConnectionId,
       organizationId: firstOrganizationId,
       userId: ownerId,
-      refreshToken: "synthetic-first-refresh",
     }, sql);
     assertEquals(firstDisconnect.providerCleanupRequired, false);
 
@@ -311,7 +328,6 @@ Deno.test("shared mailbox provider cleanup waits for the final organization", as
       connectionId: secondConnectionId,
       organizationId: secondOrganizationId,
       userId: ownerId,
-      refreshToken: "synthetic-final-refresh",
     }, sql);
     assertEquals(secondDisconnect.providerCleanupRequired, true);
     const pending = await sql<{ connection_id: string }[]>`
@@ -544,7 +560,6 @@ Deno.test("watch renewal serializes with final mailbox disconnect", async () => 
       connectionId,
       organizationId,
       userId: ownerId,
-      refreshToken: null,
     }, sql).finally(() => {
       disconnectSettled = true;
     });
@@ -584,6 +599,141 @@ Deno.test("watch renewal serializes with final mailbox disconnect", async () => 
   } finally {
     releaseWatch?.();
     await renewal?.catch(() => undefined);
+    await disconnect?.catch(() => undefined);
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_sync_states
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_connections
+      where id = ${connectionId}
+    `.catch(() => undefined);
+    await sql.end();
+  }
+});
+
+Deno.test("disconnect retains the reauthorized bundle under the provider lock", async () => {
+  const sql = postgres(databaseUrl, { max: 3 });
+  const connectionId = "f8000000-0000-0000-0000-000000000031";
+  const organizationId = "f1000000-0000-0000-0000-000000000001";
+  const ownerId = "f0000000-0000-0000-0000-000000000001";
+  const providerAccountId = "reauthorization-race@example.test";
+  Deno.env.set(
+    "GMAIL_TOKEN_ENCRYPTION_KEY",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+
+  let releaseWatch: (() => void) | undefined;
+  let reauthorization: ReturnType<typeof connectMailbox> | undefined;
+  let disconnect: ReturnType<typeof disconnectMailbox> | undefined;
+  try {
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from public.gmail_sync_states
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      delete from public.gmail_connections
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      insert into public.gmail_connections (
+        id, organization_id, provider_account_id, inbox_email, connected_by
+      ) values (
+        ${connectionId}, ${organizationId}, ${providerAccountId},
+        ${providerAccountId}, ${ownerId}
+      )
+    `;
+    await sql`
+      insert into public.gmail_sync_states (
+        connection_id, organization_id, last_history_id, watch_expiration
+      ) values (
+        ${connectionId}, ${organizationId}, '951', now() + interval '1 day'
+      )
+    `;
+    assertEquals(
+      await saveToken(connectionId, {
+        accessToken: "synthetic-stale-access",
+        refreshToken: "synthetic-stale-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      }, sql),
+      true,
+    );
+
+    const currentBundle = {
+      accessToken: "synthetic-current-access",
+      refreshToken: "synthetic-current-refresh",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    };
+    const holdWatch = new Promise<void>((resolve) => {
+      releaseWatch = resolve;
+    });
+    let watchStarted!: () => void;
+    const reauthorizationHasProviderLock = new Promise<void>((resolve) => {
+      watchStarted = resolve;
+    });
+    reauthorization = connectMailbox({
+      organizationId,
+      userId: ownerId,
+      providerAccountId,
+      inboxEmail: providerAccountId,
+      bundle: currentBundle,
+      startWatch: async () => {
+        watchStarted();
+        await holdWatch;
+        return { historyId: "952", expiration: "1893456000000" };
+      },
+    }, sql);
+    await reauthorizationHasProviderLock;
+
+    let disconnectSettled = false;
+    disconnect = disconnectMailbox({
+      connectionId,
+      organizationId,
+      userId: ownerId,
+    }, sql).finally(() => {
+      disconnectSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assertEquals(disconnectSettled, false);
+
+    releaseWatch?.();
+    await reauthorization;
+    const disconnected = await disconnect;
+    assertEquals(disconnected.providerCleanupRequired, true);
+    assertEquals(disconnected.bundle, currentBundle);
+    const pendingRevocations = await sql<{ count: number }[]>`
+      select count(*)::integer as count
+      from private.gmail_token_revocations
+      where connection_id = ${connectionId}
+    `;
+    assertEquals(pendingRevocations[0]?.count, 1);
+  } finally {
+    releaseWatch?.();
+    await reauthorization?.catch(() => undefined);
     await disconnect?.catch(() => undefined);
     await sql`
       delete from private.gmail_token_revocations

@@ -300,11 +300,10 @@ export async function disconnectMailbox(input: {
   connectionId: string;
   organizationId: string;
   userId: string;
-  refreshToken: string | null;
-}, sql = database()): Promise<{ providerCleanupRequired: boolean }> {
-  const refreshTokenCiphertext = input.refreshToken
-    ? await encryptJson({ refreshToken: input.refreshToken })
-    : null;
+}, sql = database()): Promise<{
+  providerCleanupRequired: boolean;
+  bundle: GoogleTokenBundle | null;
+}> {
   return await sql.begin(async (transaction) => {
     const targets = await transaction<{ provider_account_id: string }[]>`
       select provider_account_id
@@ -329,6 +328,17 @@ export async function disconnectMailbox(input: {
       where provider_account_id = ${providerAccountId}
       for update
     `;
+    const tokenRows = await transaction<{ token_ciphertext: string }[]>`
+      select token_ciphertext
+      from private.gmail_oauth_tokens
+      where connection_id = ${input.connectionId}
+    `;
+    const bundle = tokenRows[0]
+      ? await decryptJson<GoogleTokenBundle>(tokenRows[0].token_ciphertext)
+      : null;
+    const refreshTokenCiphertext = bundle?.refreshToken
+      ? await encryptJson({ refreshToken: bundle.refreshToken })
+      : null;
     const otherActiveConnection = connections.some((connection) =>
       connection.id !== input.connectionId &&
       connection.status !== "disconnected"
@@ -387,7 +397,7 @@ export async function disconnectMailbox(input: {
     }
       )
     `;
-    return { providerCleanupRequired };
+    return { providerCleanupRequired, bundle };
   });
 }
 

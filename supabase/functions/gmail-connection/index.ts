@@ -15,7 +15,6 @@ import {
   readJson,
 } from "../_shared/http.ts";
 import { disconnectGoogleAccess, revokeGoogleToken } from "../_shared/oauth.ts";
-import { loadToken } from "../_shared/token-store.ts";
 
 export default {
   fetch: withSupabase({ auth: "user" }, async (request, ctx) => {
@@ -64,17 +63,16 @@ export default {
         const userId = await requireOrganizationOwner(ctx, body.organizationId);
         const connection = await organizationConnection(body.organizationId);
         if (!connection) return jsonResponse({ disconnected: true });
-        const bundle = await loadToken(connection.id);
-        let providerCleanupRequired = connection.status === "disconnected";
-        if (connection.status !== "disconnected" || bundle) {
-          const disconnected = await disconnectMailbox({
+        const disconnected = connection.status !== "disconnected"
+          ? await disconnectMailbox({
             connectionId: connection.id,
             organizationId: body.organizationId,
             userId,
-            refreshToken: bundle?.refreshToken ?? null,
-          });
-          providerCleanupRequired = disconnected.providerCleanupRequired;
-        }
+          })
+          : null;
+        const bundle = disconnected?.bundle ?? null;
+        const providerCleanupRequired = disconnected?.providerCleanupRequired ??
+          true;
         if (!providerCleanupRequired) {
           return jsonResponse({ disconnected: true });
         }
