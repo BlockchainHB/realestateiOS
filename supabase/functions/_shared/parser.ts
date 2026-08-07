@@ -29,7 +29,9 @@ export type ParserResult =
     providerReference: string;
   };
 
-function looksLikeInterac(email: NormalizedEmail): boolean {
+export function isPaymentNotificationCandidate(
+  email: Pick<NormalizedEmail, "from" | "subject">,
+): boolean {
   const searchable = `${email.from} ${email.subject}`.toLowerCase();
   return searchable.includes("interac") || searchable.includes("e-transfer");
 }
@@ -37,7 +39,7 @@ function looksLikeInterac(email: NormalizedEmail): boolean {
 export async function parsePaymentNotification(
   email: NormalizedEmail,
 ): Promise<ParserResult> {
-  if (!looksLikeInterac(email)) {
+  if (!isPaymentNotificationCandidate(email)) {
     return { outcome: "ignored", parserVersion: INTERAC_PARSER_VERSION };
   }
   return {

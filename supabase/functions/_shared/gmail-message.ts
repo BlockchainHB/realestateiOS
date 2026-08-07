@@ -1,7 +1,10 @@
 import { base64UrlDecode } from "./crypto.ts";
 import type { GoogleTokenBundle } from "./oauth.ts";
 import { gmailApi } from "./oauth.ts";
-import type { NormalizedEmail } from "./parser.ts";
+import {
+  isPaymentNotificationCandidate,
+  type NormalizedEmail,
+} from "./parser.ts";
 
 interface GmailHeader {
   name?: string;
@@ -43,19 +46,35 @@ function findTextPart(part: GmailPart | undefined): string | null {
   return null;
 }
 
-export async function getNormalizedEmail(
+function gmailMessagePath(
+  messageId: string,
+  format: "metadata" | "full",
+): string {
+  const parameters = new URLSearchParams({ format });
+  if (format === "metadata") {
+    parameters.append("metadataHeaders", "From");
+    parameters.append("metadataHeaders", "Subject");
+  }
+  return `/messages/${encodeURIComponent(messageId)}?${parameters.toString()}`;
+}
+
+async function getGmailMessage(
   bundle: GoogleTokenBundle,
   messageId: string,
-): Promise<NormalizedEmail> {
-  const message = await gmailApi<GmailMessage>(
+  format: "metadata" | "full",
+): Promise<GmailMessage> {
+  return await gmailApi<GmailMessage>(
     bundle,
-    `/messages/${encodeURIComponent(messageId)}?format=full`,
+    gmailMessagePath(messageId, format),
     {},
     {
       notFoundCode: "gmail_message_not_found",
       notFoundMessage: "The Gmail message is no longer available.",
     },
   );
+}
+
+function normalizeGmailMessage(message: GmailMessage): NormalizedEmail {
   const headers = collectHeaders(message.payload?.headers);
   const internalDate = message.internalDate
     ? Number(message.internalDate)
@@ -71,4 +90,17 @@ export async function getNormalizedEmail(
     bodyText: findTextPart(message.payload) ?? "",
     headers,
   };
+}
+
+export async function getNormalizedEmail(
+  bundle: GoogleTokenBundle,
+  messageId: string,
+): Promise<NormalizedEmail> {
+  const metadata = normalizeGmailMessage(
+    await getGmailMessage(bundle, messageId, "metadata"),
+  );
+  if (!isPaymentNotificationCandidate(metadata)) return metadata;
+  return normalizeGmailMessage(
+    await getGmailMessage(bundle, messageId, "full"),
+  );
 }

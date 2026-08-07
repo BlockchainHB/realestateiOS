@@ -240,6 +240,86 @@ Deno.test("Gmail mailbox identity retries one transient profile failure", async 
   }
 });
 
+Deno.test("Gmail bodies are fetched only for payment candidates", async () => {
+  const originalFetch = globalThis.fetch;
+  const requests: Array<{ messageId: string; format: string | null }> = [];
+  globalThis.fetch = ((input: string | URL | Request) => {
+    const url = new URL(
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+        ? input.toString()
+        : input.url,
+    );
+    const messageId = url.pathname.split("/").at(-1) ?? "";
+    const format = url.searchParams.get("format");
+    requests.push({ messageId, format });
+    const common = {
+      id: messageId,
+      historyId: "751",
+      internalDate: "1893456000000",
+    };
+    if (format === "metadata") {
+      assertEquals(url.searchParams.getAll("metadataHeaders"), [
+        "From",
+        "Subject",
+      ]);
+      return Promise.resolve(Response.json({
+        ...common,
+        payload: {
+          headers: messageId === "candidate-message"
+            ? [
+              { name: "From", value: "Interac <notify@example.test>" },
+              { name: "Subject", value: "Interac e-Transfer" },
+            ]
+            : [
+              { name: "From", value: "newsletter@example.test" },
+              { name: "Subject", value: "Weekly update" },
+            ],
+        },
+      }));
+    }
+    if (messageId === "candidate-message" && format === "full") {
+      return Promise.resolve(Response.json({
+        ...common,
+        payload: {
+          mimeType: "text/plain",
+          headers: [
+            { name: "From", value: "Interac <notify@example.test>" },
+            { name: "Subject", value: "Interac e-Transfer" },
+          ],
+          body: {
+            data: base64UrlEncode(
+              new TextEncoder().encode("Synthetic provider body"),
+            ),
+          },
+        },
+      }));
+    }
+    return Promise.reject(new Error(`Unexpected Gmail request: ${url}`));
+  }) as typeof fetch;
+  const bundle = {
+    accessToken: "synthetic-access",
+    refreshToken: "synthetic-refresh",
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+  };
+
+  try {
+    const unrelated = await getNormalizedEmail(bundle, "unrelated-message");
+    const candidate = await getNormalizedEmail(bundle, "candidate-message");
+    assertEquals(unrelated.bodyText, "");
+    assertEquals(candidate.bodyText, "Synthetic provider body");
+    assertEquals(requests, [
+      { messageId: "unrelated-message", format: "metadata" },
+      { messageId: "candidate-message", format: "metadata" },
+      { messageId: "candidate-message", format: "full" },
+    ]);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 Deno.test("permanently unavailable Gmail messages have a skippable error identity", async () => {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (() =>
