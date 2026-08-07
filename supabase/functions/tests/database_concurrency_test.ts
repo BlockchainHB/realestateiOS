@@ -1,5 +1,5 @@
 import { assertEquals, assertMatch } from "jsr:@std/assert@1.0.14";
-import postgres from "npm:postgres@3.4.9";
+import postgres, { type Sql } from "npm:postgres@3.4.9";
 import {
   cleanupProviderAccessIfUnused,
   connectMailbox,
@@ -12,6 +12,26 @@ import { renewConnectionWatch } from "../_shared/sync.ts";
 
 const databaseUrl = Deno.env.get("SUPABASE_DB_URL");
 if (!databaseUrl) throw new Error("SUPABASE_DB_URL is required");
+
+async function registerConnectionIntent(
+  sql: Sql,
+  organizationId: string,
+  userId: string,
+  stateHash: string,
+): Promise<void> {
+  await sql`
+    insert into private.gmail_connection_intents (
+      organization_id, state_hash, requested_by, expires_at
+    ) values (
+      ${organizationId}, ${stateHash}, ${userId}, now() + interval '10 minutes'
+    )
+    on conflict (organization_id) do update
+    set state_hash = excluded.state_hash,
+        requested_by = excluded.requested_by,
+        expires_at = excluded.expires_at,
+        created_at = now()
+  `;
+}
 
 Deno.test("concurrent owner revocations retain one active owner", async () => {
   const sql = postgres(databaseUrl, { max: 3 });
@@ -318,14 +338,12 @@ Deno.test("shared mailbox provider cleanup waits for the final organization", as
     assertEquals(failedCallbackCleanupCalls, 0);
 
     const firstDisconnect = await disconnectMailbox({
-      connectionId: firstConnectionId,
       organizationId: firstOrganizationId,
       userId: ownerId,
     }, sql);
     assertEquals(firstDisconnect.providerCleanupRequired, false);
 
     const secondDisconnect = await disconnectMailbox({
-      connectionId: secondConnectionId,
       organizationId: secondOrganizationId,
       userId: ownerId,
     }, sql);
@@ -395,6 +413,13 @@ Deno.test("overlapping provider setup is rejected before a watch can start", asy
       firstWatchStarted = resolve;
     });
     let firstWatchCalls = 0;
+    const intentStateHash = "8".repeat(64);
+    await registerConnectionIntent(
+      sql,
+      organizationId,
+      ownerId,
+      intentStateHash,
+    );
     firstSetup = connectMailbox({
       organizationId,
       userId: ownerId,
@@ -406,6 +431,7 @@ Deno.test("overlapping provider setup is rejected before a watch can start", asy
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
         scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
       },
+      intentStateHash,
       startWatch: async () => {
         firstWatchCalls += 1;
         firstWatchStarted();
@@ -416,7 +442,7 @@ Deno.test("overlapping provider setup is rejected before a watch can start", asy
     await firstHasProviderLock;
 
     let secondWatchCalls = 0;
-    const secondSetup = await connectMailbox({
+    const secondSetupPromise = connectMailbox({
       organizationId,
       userId: ownerId,
       providerAccountId,
@@ -427,6 +453,7 @@ Deno.test("overlapping provider setup is rejected before a watch can start", asy
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
         scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
       },
+      intentStateHash,
       startWatch: () => {
         secondWatchCalls += 1;
         return Promise.resolve({
@@ -438,18 +465,19 @@ Deno.test("overlapping provider setup is rejected before a watch can start", asy
       () => ({ error: null }),
       (error: unknown) => ({ error }),
     );
-    assertEquals(secondSetup.error instanceof HttpError, true);
-    assertEquals(
-      secondSetup.error instanceof HttpError ? secondSetup.error.code : null,
-      "gmail_provider_operation_in_progress",
-    );
-    assertEquals(secondWatchCalls, 0);
-
     releaseFirstWatch?.();
     const firstResult = await firstSetup;
     firstConnectionId = firstResult.connectionId;
     assertEquals(firstWatchCalls, 1);
     assertEquals(firstResult.watch.historyId, "801");
+
+    const secondSetup = await secondSetupPromise;
+    assertEquals(secondSetup.error instanceof HttpError, true);
+    assertEquals(
+      secondSetup.error instanceof HttpError ? secondSetup.error.code : null,
+      "gmail_connection_cancelled",
+    );
+    assertEquals(secondWatchCalls, 0);
   } finally {
     releaseFirstWatch?.();
     const unfinishedResult = await firstSetup?.catch(() => null);
@@ -557,7 +585,6 @@ Deno.test("watch renewal serializes with final mailbox disconnect", async () => 
 
     let disconnectSettled = false;
     disconnect = disconnectMailbox({
-      connectionId,
       organizationId,
       userId: ownerId,
     }, sql).finally(() => {
@@ -695,12 +722,20 @@ Deno.test("disconnect retains the reauthorized bundle under the provider lock", 
     const reauthorizationHasProviderLock = new Promise<void>((resolve) => {
       watchStarted = resolve;
     });
+    const intentStateHash = "9".repeat(64);
+    await registerConnectionIntent(
+      sql,
+      organizationId,
+      ownerId,
+      intentStateHash,
+    );
     reauthorization = connectMailbox({
       organizationId,
       userId: ownerId,
       providerAccountId,
       inboxEmail: providerAccountId,
       bundle: currentBundle,
+      intentStateHash,
       startWatch: async () => {
         watchStarted();
         await holdWatch;
@@ -711,7 +746,6 @@ Deno.test("disconnect retains the reauthorized bundle under the provider lock", 
 
     let disconnectSettled = false;
     disconnect = disconnectMailbox({
-      connectionId,
       organizationId,
       userId: ownerId,
     }, sql).finally(() => {
@@ -819,12 +853,20 @@ Deno.test("disconnect rechecks a stale disconnected snapshot under the provider 
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
     };
+    const intentStateHash = "a".repeat(64);
+    await registerConnectionIntent(
+      sql,
+      organizationId,
+      ownerId,
+      intentStateHash,
+    );
     await connectMailbox({
       organizationId,
       userId: ownerId,
       providerAccountId,
       inboxEmail: providerAccountId,
       bundle: currentBundle,
+      intentStateHash,
       startWatch: () =>
         Promise.resolve({
           historyId: "972",
@@ -833,7 +875,6 @@ Deno.test("disconnect rechecks a stale disconnected snapshot under the provider 
     }, sql);
 
     const disconnected = await disconnectMailbox({
-      connectionId,
       organizationId,
       userId: ownerId,
     }, sql);
@@ -867,6 +908,119 @@ Deno.test("disconnect rechecks a stale disconnected snapshot under the provider 
     await sql`
       delete from public.gmail_connections
       where id = ${connectionId}
+    `.catch(() => undefined);
+    await sql.end();
+  }
+});
+
+Deno.test("disconnect cancels an OAuth callback before its connection row exists", async () => {
+  const sql = postgres(databaseUrl, { max: 3 });
+  const organizationId = "f1000000-0000-0000-0000-000000000001";
+  const ownerId = "f0000000-0000-0000-0000-000000000001";
+  const providerAccountId = "cancelled-before-connect@example.test";
+  const intentStateHash = "b".repeat(64);
+  Deno.env.set(
+    "GMAIL_TOKEN_ENCRYPTION_KEY",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+
+  try {
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from public.gmail_sync_states
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      delete from public.gmail_connections
+      where organization_id = ${organizationId}
+    `;
+    await registerConnectionIntent(
+      sql,
+      organizationId,
+      ownerId,
+      intentStateHash,
+    );
+
+    const disconnected = await disconnectMailbox({
+      organizationId,
+      userId: ownerId,
+    }, sql);
+    assertEquals(disconnected.connectionId, null);
+
+    let watchCalls = 0;
+    const attemptedConnection = await connectMailbox({
+      organizationId,
+      userId: ownerId,
+      providerAccountId,
+      inboxEmail: providerAccountId,
+      bundle: {
+        accessToken: "synthetic-cancelled-access",
+        refreshToken: "synthetic-cancelled-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      },
+      intentStateHash,
+      startWatch: () => {
+        watchCalls += 1;
+        return Promise.resolve({
+          historyId: "981",
+          expiration: "1893456000000",
+        });
+      },
+    }, sql).then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error }),
+    );
+    assertEquals(attemptedConnection.error instanceof HttpError, true);
+    assertEquals(
+      attemptedConnection.error instanceof HttpError
+        ? attemptedConnection.error.code
+        : null,
+      "gmail_connection_cancelled",
+    );
+    assertEquals(watchCalls, 0);
+    const connections = await sql<{ count: number }[]>`
+      select count(*)::integer as count
+      from public.gmail_connections
+      where organization_id = ${organizationId}
+    `;
+    assertEquals(connections[0]?.count, 0);
+  } finally {
+    await sql`
+      delete from private.gmail_connection_intents
+      where organization_id = ${organizationId}
+    `.catch(() => undefined);
+    await sql`
+      delete from private.gmail_oauth_authorization_states
+      where organization_id = ${organizationId}
+    `.catch(() => undefined);
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_sync_states
+      where organization_id = ${organizationId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_connections
+      where organization_id = ${organizationId}
     `.catch(() => undefined);
     await sql.end();
   }

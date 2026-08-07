@@ -1,7 +1,7 @@
 begin;
 
 create extension if not exists pgtap with schema extensions;
-select plan(50);
+select plan(51);
 
 insert into auth.users (
   instance_id,
@@ -166,7 +166,7 @@ select is((
   )
 ), 6::bigint, 'auth trigger creates one profile per fixture auth user');
 select is((select count(*) from pg_class where relnamespace = 'public'::regnamespace and relkind = 'r' and relrowsecurity), 14::bigint, 'every public table has RLS enabled');
-select is((select count(*) from pg_class where relnamespace = 'private'::regnamespace and relkind = 'r' and relrowsecurity and relforcerowsecurity), 4::bigint, 'private tables force RLS');
+select is((select count(*) from pg_class where relnamespace = 'private'::regnamespace and relkind = 'r' and relrowsecurity and relforcerowsecurity), 5::bigint, 'private tables force RLS');
 
 set local role authenticated;
 select set_config('request.jwt.claim.sub', '10000000-0000-0000-0000-000000000001', true);
@@ -251,6 +251,7 @@ select is((select count(*) from pg_proc procedure join pg_namespace namespace on
 select is(has_function_privilege('public', 'private.is_organization_owner(uuid)', 'execute'), false, 'PUBLIC cannot execute private owner helper');
 select is(has_table_privilege('authenticated', 'private.gmail_oauth_tokens', 'select'), false, 'authenticated role has no token-table privilege');
 select is(has_table_privilege('authenticated', 'private.gmail_token_revocations', 'select'), false, 'authenticated role has no provider-cleanup credential access');
+select is(has_table_privilege('authenticated', 'private.gmail_connection_intents', 'select'), false, 'authenticated role has no Gmail connection-intent access');
 select lives_ok($$insert into private.gmail_notification_receipts (pubsub_message_id, notified_history_id, outcome) values ('synthetic-pubsub-duplicate', '303', 'processing') on conflict (pubsub_message_id) do nothing; insert into private.gmail_notification_receipts (pubsub_message_id, notified_history_id, outcome) values ('synthetic-pubsub-duplicate', '303', 'processing') on conflict (pubsub_message_id) do nothing$$, 'duplicate Pub/Sub delivery is harmless');
 insert into private.gmail_notification_receipts (pubsub_message_id, notified_history_id, received_at, outcome)
 values ('synthetic-pubsub-stale', '404', now() - interval '6 minutes', 'processing');

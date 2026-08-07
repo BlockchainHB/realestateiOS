@@ -7,10 +7,11 @@ export interface OAuthAuthorizationState {
   userId: string;
   codeVerifier: string;
   returnUrl: string;
+  intentStateHash: string;
 }
 
 export async function storeAuthorizationState(
-  input: OAuthAuthorizationState & {
+  input: Omit<OAuthAuthorizationState, "intentStateHash"> & {
     state: string;
   },
 ): Promise<void> {
@@ -19,27 +20,56 @@ export async function storeAuthorizationState(
   const verifierCiphertext = await encryptJson({
     codeVerifier: input.codeVerifier,
   });
-  await sql`
-    delete from private.gmail_oauth_authorization_states
-    where expires_at <= now()
-  `;
-  await sql`
-    insert into private.gmail_oauth_authorization_states (
-      state_hash,
-      organization_id,
-      user_id,
-      verifier_ciphertext,
-      return_url,
-      expires_at
-    ) values (
-      ${stateHash},
-      ${input.organizationId},
-      ${input.userId},
-      ${verifierCiphertext},
-      ${input.returnUrl},
-      now() + interval '10 minutes'
-    )
-  `;
+  await sql.begin(async (transaction) => {
+    await transaction`
+      select pg_advisory_xact_lock(
+        hashtextextended(${"gmail-org:" + input.organizationId}, 0)
+      )
+    `;
+    await transaction`
+      delete from private.gmail_oauth_authorization_states
+      where expires_at <= now()
+    `;
+    await transaction`
+      delete from private.gmail_connection_intents
+      where expires_at <= now()
+    `;
+    await transaction`
+      insert into private.gmail_oauth_authorization_states (
+        state_hash,
+        organization_id,
+        user_id,
+        verifier_ciphertext,
+        return_url,
+        expires_at
+      ) values (
+        ${stateHash},
+        ${input.organizationId},
+        ${input.userId},
+        ${verifierCiphertext},
+        ${input.returnUrl},
+        now() + interval '10 minutes'
+      )
+    `;
+    await transaction`
+      insert into private.gmail_connection_intents (
+        organization_id,
+        state_hash,
+        requested_by,
+        expires_at
+      ) values (
+        ${input.organizationId},
+        ${stateHash},
+        ${input.userId},
+        now() + interval '10 minutes'
+      )
+      on conflict (organization_id) do update
+      set state_hash = excluded.state_hash,
+          requested_by = excluded.requested_by,
+          expires_at = excluded.expires_at,
+          created_at = now()
+    `;
+  });
 }
 
 export async function consumeAuthorizationState(
@@ -68,6 +98,7 @@ export async function consumeAuthorizationState(
     userId: row.user_id,
     codeVerifier: decrypted.codeVerifier,
     returnUrl: row.return_url,
+    intentStateHash: stateHash,
   };
 }
 

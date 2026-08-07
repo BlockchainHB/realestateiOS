@@ -46,6 +46,7 @@ export async function connectMailbox(input: {
   providerAccountId: string;
   inboxEmail: string;
   bundle: GoogleTokenBundle;
+  intentStateHash: string;
   startWatch: () => Promise<{ historyId: string; expiration: string }>;
 }, sql = database()): Promise<{
   connectionId: string;
@@ -55,6 +56,26 @@ export async function connectMailbox(input: {
   const providerAccountId = input.providerAccountId.toLowerCase();
   const inboxEmail = input.inboxEmail.toLowerCase();
   return await sql.begin(async (transaction) => {
+    await transaction`
+      select pg_advisory_xact_lock(
+        hashtextextended(${"gmail-org:" + input.organizationId}, 0)
+      )
+    `;
+    const connectionIntents = await transaction<{ organization_id: string }[]>`
+      select organization_id
+      from private.gmail_connection_intents
+      where organization_id = ${input.organizationId}
+        and state_hash = ${input.intentStateHash}
+        and requested_by = ${input.userId}
+        and expires_at > now()
+    `;
+    if (!connectionIntents[0]) {
+      throw new HttpError(
+        409,
+        "gmail_connection_cancelled",
+        "This Gmail connection attempt was cancelled or replaced.",
+      );
+    }
     const providerLocks = await transaction<{ acquired: boolean }[]>`
       select pg_try_advisory_xact_lock(
         hashtextextended(${providerAccountId}, 0)
@@ -102,10 +123,12 @@ export async function connectMailbox(input: {
     const existingConnections = await transaction<{
       provider_account_id: string;
       last_history_id: string | null;
+      last_history_snapshot_at: string | null;
       revocation_pending: boolean;
     }[]>`
       select connection.provider_account_id,
              state.last_history_id,
+             state.last_history_snapshot_at,
              revocation.connection_id is not null as revocation_pending
       from public.gmail_connections connection
       left join public.gmail_sync_states state
@@ -132,11 +155,15 @@ export async function connectMailbox(input: {
         "Disconnecting does not replace the mailbox identity retained by payment source records.",
       );
     }
+    const watchSnapshotStartedAt = new Date().toISOString();
     const watch = await input.startWatch();
     const historyCursor = preservedHistoryCursor(
       existingConnections[0]?.last_history_id,
       watch.historyId,
     );
+    const historySnapshotAt = existingConnections[0]?.last_history_id
+      ? existingConnections[0].last_history_snapshot_at
+      : watchSnapshotStartedAt;
 
     const connections = await transaction<{ id: string }[]>`
       insert into public.gmail_connections (
@@ -203,6 +230,7 @@ export async function connectMailbox(input: {
         connection_id,
         organization_id,
         last_history_id,
+        last_history_snapshot_at,
         watch_expiration,
         status,
         consecutive_failures
@@ -210,6 +238,7 @@ export async function connectMailbox(input: {
         ${connectionId},
         ${input.organizationId},
         ${historyCursor},
+        ${historySnapshotAt},
         to_timestamp(${watch.expiration}::numeric / 1000),
         'idle',
         0
@@ -220,6 +249,11 @@ export async function connectMailbox(input: {
             public.gmail_sync_states.last_history_id,
             excluded.last_history_id
           ),
+          last_history_snapshot_at = case
+            when public.gmail_sync_states.last_history_id is null
+              then excluded.last_history_snapshot_at
+            else public.gmail_sync_states.last_history_snapshot_at
+          end,
           watch_expiration = excluded.watch_expiration,
           status = 'idle',
           consecutive_failures = 0,
@@ -242,6 +276,11 @@ export async function connectMailbox(input: {
         ${connectionId},
         ${transaction.json({ scope: "gmail.readonly" })}
       )
+    `;
+    await transaction`
+      delete from private.gmail_connection_intents
+      where organization_id = ${input.organizationId}
+        and state_hash = ${input.intentStateHash}
     `;
     return { connectionId, watch };
   });
@@ -297,27 +336,43 @@ export async function cleanupProviderAccessIfUnused<T>(
 }
 
 export async function disconnectMailbox(input: {
-  connectionId: string;
   organizationId: string;
   userId: string;
 }, sql = database()): Promise<{
+  connectionId: string | null;
   providerCleanupRequired: boolean;
   bundle: GoogleTokenBundle | null;
 }> {
   return await sql.begin(async (transaction) => {
-    const targets = await transaction<{ provider_account_id: string }[]>`
-      select provider_account_id
-      from public.gmail_connections
-      where id = ${input.connectionId}
-        and organization_id = ${input.organizationId}
+    await transaction`
+      select pg_advisory_xact_lock(
+        hashtextextended(${"gmail-org:" + input.organizationId}, 0)
+      )
     `;
+    await transaction`
+      delete from private.gmail_connection_intents
+      where organization_id = ${input.organizationId}
+    `;
+    await transaction`
+      delete from private.gmail_oauth_authorization_states
+      where organization_id = ${input.organizationId}
+    `;
+    const targets = await transaction<{
+      id: string;
+      provider_account_id: string;
+    }[]>`
+      select id, provider_account_id
+      from public.gmail_connections
+      where organization_id = ${input.organizationId}
+    `;
+    const connectionId = targets[0]?.id;
     const providerAccountId = targets[0]?.provider_account_id;
-    if (!providerAccountId) {
-      throw new HttpError(
-        404,
-        "gmail_connection_not_found",
-        "The Gmail connection was not found.",
-      );
+    if (!connectionId || !providerAccountId) {
+      return {
+        connectionId: null,
+        providerCleanupRequired: false,
+        bundle: null,
+      };
     }
     await transaction`
       select pg_advisory_xact_lock(hashtextextended(${providerAccountId}, 0))
@@ -331,12 +386,12 @@ export async function disconnectMailbox(input: {
     const tokenRows = await transaction<{ token_ciphertext: string }[]>`
       select token_ciphertext
       from private.gmail_oauth_tokens
-      where connection_id = ${input.connectionId}
+      where connection_id = ${connectionId}
     `;
     const pendingRevocations = await transaction<{ connection_id: string }[]>`
       select connection_id
       from private.gmail_token_revocations
-      where connection_id = ${input.connectionId}
+      where connection_id = ${connectionId}
     `;
     const bundle = tokenRows[0]
       ? await decryptJson<GoogleTokenBundle>(tokenRows[0].token_ciphertext)
@@ -345,7 +400,7 @@ export async function disconnectMailbox(input: {
       ? await encryptJson({ refreshToken: bundle.refreshToken })
       : null;
     const otherActiveConnection = connections.some((connection) =>
-      connection.id !== input.connectionId &&
+      connection.id !== connectionId &&
       connection.status !== "disconnected"
     );
     const providerCleanupRequired = !otherActiveConnection && Boolean(
@@ -357,7 +412,7 @@ export async function disconnectMailbox(input: {
           connection_id,
           refresh_token_ciphertext
         ) values (
-          ${input.connectionId},
+          ${connectionId},
           ${refreshTokenCiphertext}
         )
         on conflict (connection_id) do update
@@ -367,14 +422,14 @@ export async function disconnectMailbox(input: {
     }
     await transaction`
       delete from private.gmail_oauth_tokens
-      where connection_id = ${input.connectionId}
+      where connection_id = ${connectionId}
     `;
     await transaction`
       update public.gmail_connections
       set status = 'disconnected',
           disconnected_at = now(),
           last_error_code = null
-      where id = ${input.connectionId}
+      where id = ${connectionId}
         and organization_id = ${input.organizationId}
     `;
     await transaction`
@@ -390,7 +445,7 @@ export async function disconnectMailbox(input: {
         ${input.userId},
         'gmail.disconnected',
         'gmail_connection',
-        ${input.connectionId},
+        ${connectionId},
         ${
       transaction.json({
         provider_revocation: providerCleanupRequired
@@ -402,7 +457,7 @@ export async function disconnectMailbox(input: {
     }
       )
     `;
-    return { providerCleanupRequired, bundle };
+    return { connectionId, providerCleanupRequired, bundle };
   });
 }
 

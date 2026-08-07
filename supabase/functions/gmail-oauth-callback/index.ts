@@ -76,6 +76,7 @@ export default {
         providerAccountId: issuedProviderAccountId,
         inboxEmail: mailbox.emailAddress,
         bundle: bundleForConnection,
+        intentStateHash: state.intentStateHash,
         startWatch: () => startGmailWatch(bundleForConnection),
       });
       connectionStored = true;

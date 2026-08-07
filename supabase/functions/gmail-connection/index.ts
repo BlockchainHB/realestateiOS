@@ -4,7 +4,6 @@ import { requireOrganizationOwner } from "../_shared/authorization.ts";
 import {
   completeRevocationCleanup,
   disconnectMailbox,
-  organizationConnection,
   pendingRevocationToken,
 } from "../_shared/connections.ts";
 import { database } from "../_shared/database.ts";
@@ -61,13 +60,12 @@ export default {
           );
         }
         const userId = await requireOrganizationOwner(ctx, body.organizationId);
-        const connection = await organizationConnection(body.organizationId);
-        if (!connection) return jsonResponse({ disconnected: true });
         const disconnected = await disconnectMailbox({
-          connectionId: connection.id,
           organizationId: body.organizationId,
           userId,
         });
+        const connectionId = disconnected.connectionId;
+        if (!connectionId) return jsonResponse({ disconnected: true });
         const bundle = disconnected.bundle;
         const providerCleanupRequired = disconnected.providerCleanupRequired;
         if (!providerCleanupRequired) {
@@ -86,7 +84,7 @@ export default {
           revocationConfirmed = outcome.revocation === "revoked";
         } else {
           const pendingRefreshToken = await pendingRevocationToken(
-            connection.id,
+            connectionId,
           );
           if (pendingRefreshToken) {
             try {
@@ -108,7 +106,7 @@ export default {
           );
         }
         await completeRevocationCleanup({
-          connectionId: connection.id,
+          connectionId,
           organizationId: body.organizationId,
           userId,
         });
