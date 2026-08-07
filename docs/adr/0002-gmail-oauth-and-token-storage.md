@@ -28,9 +28,11 @@ Pub/Sub push uses a dedicated service account and authenticated push. The endpoi
 
 Watches are selected for renewal two days before expiry and should be scheduled daily. Recovery synchronization calls `history.list` for connections without a recent successful sync. If Google can no longer serve the cursor, the connection moves to a delayed/reauthorization-safe state; this foundation does not perform a speculative full-mailbox scan.
 
+One Google mailbox may serve multiple organizations, while Gmail watches and OAuth revocation are mailbox/provider-wide. Connect and disconnect transitions therefore serialize on the canonical Google account identity. Disconnect is local for one organization while another active connection remains; watch shutdown and grant revocation occur only when the final active organization disconnects. A pending final revocation blocks reconnect until provider cleanup succeeds.
+
 ## Parser boundary
 
-Only explicitly marked, redacted synthetic fixtures parse in this change. Suspected Interac messages without an approved versioned parser are stored as unsupported source events with a content hash, not a body. Unrelated messages are not retained. No source event is a ledger payment, and reversals/cancellations always start in owner review.
+Deployed intake contains no synthetic or speculative Interac grammar. Suspected Interac messages remain unsupported and are stored with a content hash, not a body, until an approved versioned production parser exists. Redacted synthetic fixtures are exercised only through a test-tree adapter that deployed functions never import. Unrelated messages are not retained. No source event is a ledger payment, and reversals/cancellations always start in owner review.
 
 ## References
 

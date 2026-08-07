@@ -65,13 +65,18 @@ export default {
         const connection = await organizationConnection(body.organizationId);
         if (!connection) return jsonResponse({ disconnected: true });
         const bundle = await loadToken(connection.id);
+        let providerCleanupRequired = connection.status === "disconnected";
         if (connection.status !== "disconnected" || bundle) {
-          await disconnectMailbox({
+          const disconnected = await disconnectMailbox({
             connectionId: connection.id,
             organizationId: body.organizationId,
             userId,
             refreshToken: bundle?.refreshToken ?? null,
           });
+          providerCleanupRequired = disconnected.providerCleanupRequired;
+        }
+        if (!providerCleanupRequired) {
+          return jsonResponse({ disconnected: true });
         }
 
         let revocationConfirmed = false;

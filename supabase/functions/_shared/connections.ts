@@ -53,6 +53,24 @@ export async function connectMailbox(input: {
   const providerAccountId = input.providerAccountId.toLowerCase();
   const inboxEmail = input.inboxEmail.toLowerCase();
   return await sql.begin(async (transaction) => {
+    await transaction`
+      select pg_advisory_xact_lock(hashtextextended(${providerAccountId}, 0))
+    `;
+    const pendingRevocations = await transaction<{ connection_id: string }[]>`
+      select revocation.connection_id
+      from private.gmail_token_revocations revocation
+      join public.gmail_connections connection
+        on connection.id = revocation.connection_id
+      where connection.provider_account_id = ${providerAccountId}
+      limit 1
+    `;
+    if (pendingRevocations[0]) {
+      throw new HttpError(
+        409,
+        "gmail_revocation_pending",
+        "Retry the previous Google disconnect before reconnecting this mailbox.",
+      );
+    }
     const owners = await transaction<{ id: string }[]>`
       select id
       from public.organization_memberships
@@ -247,26 +265,42 @@ export async function disconnectMailbox(input: {
   organizationId: string;
   userId: string;
   refreshToken: string | null;
-}): Promise<void> {
+}, sql = database()): Promise<{ providerCleanupRequired: boolean }> {
   const refreshTokenCiphertext = input.refreshToken
     ? await encryptJson({ refreshToken: input.refreshToken })
     : null;
-  await database().begin(async (transaction) => {
-    const connections = await transaction<{ id: string }[]>`
-      select id
+  return await sql.begin(async (transaction) => {
+    const targets = await transaction<{ provider_account_id: string }[]>`
+      select provider_account_id
       from public.gmail_connections
       where id = ${input.connectionId}
         and organization_id = ${input.organizationId}
-      for update
     `;
-    if (!connections[0]) {
+    const providerAccountId = targets[0]?.provider_account_id;
+    if (!providerAccountId) {
       throw new HttpError(
         404,
         "gmail_connection_not_found",
         "The Gmail connection was not found.",
       );
     }
-    if (refreshTokenCiphertext) {
+    await transaction`
+      select pg_advisory_xact_lock(hashtextextended(${providerAccountId}, 0))
+    `;
+    const connections = await transaction<{ id: string; status: string }[]>`
+      select id, status
+      from public.gmail_connections
+      where provider_account_id = ${providerAccountId}
+      for update
+    `;
+    const otherActiveConnection = connections.some((connection) =>
+      connection.id !== input.connectionId &&
+      connection.status !== "disconnected"
+    );
+    const providerCleanupRequired = Boolean(
+      refreshTokenCiphertext && !otherActiveConnection,
+    );
+    if (providerCleanupRequired) {
       await transaction`
         insert into private.gmail_token_revocations (
           connection_id,
@@ -308,13 +342,16 @@ export async function disconnectMailbox(input: {
         ${input.connectionId},
         ${
       transaction.json({
-        provider_revocation: refreshTokenCiphertext
+        provider_revocation: providerCleanupRequired
           ? "pending"
+          : otherActiveConnection
+          ? "shared_mailbox_retained"
           : "token_missing",
       })
     }
       )
     `;
+    return { providerCleanupRequired };
   });
 }
 

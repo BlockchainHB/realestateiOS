@@ -2,7 +2,7 @@
 
 ## Implementation and security
 
-- [ ] Replace the synthetic-only parser only after receiving authorized, redacted real examples and recording a new parser version.
+- [ ] Add a production Interac parser only after receiving authorized, redacted real examples and recording a new parser version.
 - [ ] Complete threat modelling for OAuth state, token custody, Pub/Sub replay, data deletion, and support access.
 - [ ] Confirm no token, code, verifier, email body, or secret enters logs, analytics, screenshots, fixtures, or crash reports.
 - [ ] Verify owner, manager, tenant, former-tenant, anonymous, and cross-organization authorization against the hosted project.

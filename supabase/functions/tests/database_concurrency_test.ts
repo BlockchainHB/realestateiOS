@@ -1,5 +1,6 @@
 import { assertEquals, assertMatch } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.9";
+import { disconnectMailbox } from "../_shared/connections.ts";
 import { claimNotificationReceipt } from "../_shared/notification-receipts.ts";
 import { saveToken } from "../_shared/token-store.ts";
 
@@ -240,6 +241,76 @@ Deno.test("abandoned Pub/Sub processing receipts are reclaimed once", async () =
     await sql`
       delete from private.gmail_notification_receipts
       where pubsub_message_id = ${messageId}
+    `.catch(() => undefined);
+    await sql.end();
+  }
+});
+
+Deno.test("shared mailbox provider cleanup waits for the final organization", async () => {
+  const sql = postgres(databaseUrl, { max: 2 });
+  const ownerId = "f0000000-0000-0000-0000-000000000001";
+  const firstOrganizationId = "f1000000-0000-0000-0000-000000000001";
+  const secondOrganizationId = "f1000000-0000-0000-0000-000000000002";
+  const firstConnectionId = "f8000000-0000-0000-0000-000000000011";
+  const secondConnectionId = "f8000000-0000-0000-0000-000000000012";
+  const providerAccountId = "shared-race@example.test";
+  Deno.env.set(
+    "GMAIL_TOKEN_ENCRYPTION_KEY",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+
+  try {
+    await sql`
+      insert into public.organizations (id, name, created_by)
+      values (${secondOrganizationId}, 'Synthetic Shared Mailbox', ${ownerId})
+      on conflict (id) do nothing
+    `;
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id in (${firstConnectionId}, ${secondConnectionId})
+    `;
+    await sql`
+      delete from public.gmail_connections
+      where id in (${firstConnectionId}, ${secondConnectionId})
+    `;
+    await sql`
+      insert into public.gmail_connections (
+        id, organization_id, provider_account_id, inbox_email, connected_by
+      ) values
+        (${firstConnectionId}, ${firstOrganizationId}, ${providerAccountId}, ${providerAccountId}, ${ownerId}),
+        (${secondConnectionId}, ${secondOrganizationId}, ${providerAccountId}, ${providerAccountId}, ${ownerId})
+    `;
+
+    const firstDisconnect = await disconnectMailbox({
+      connectionId: firstConnectionId,
+      organizationId: firstOrganizationId,
+      userId: ownerId,
+      refreshToken: "synthetic-first-refresh",
+    }, sql);
+    assertEquals(firstDisconnect.providerCleanupRequired, false);
+
+    const secondDisconnect = await disconnectMailbox({
+      connectionId: secondConnectionId,
+      organizationId: secondOrganizationId,
+      userId: ownerId,
+      refreshToken: "synthetic-final-refresh",
+    }, sql);
+    assertEquals(secondDisconnect.providerCleanupRequired, true);
+    const pending = await sql<{ connection_id: string }[]>`
+      select connection_id
+      from private.gmail_token_revocations
+      where connection_id in (${firstConnectionId}, ${secondConnectionId})
+    `;
+    assertEquals(pending.length, 1);
+    assertEquals(pending[0]?.connection_id, secondConnectionId);
+  } finally {
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id in (${firstConnectionId}, ${secondConnectionId})
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_connections
+      where id in (${firstConnectionId}, ${secondConnectionId})
     `.catch(() => undefined);
     await sql.end();
   }

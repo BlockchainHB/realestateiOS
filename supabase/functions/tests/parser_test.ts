@@ -23,6 +23,7 @@ import type { NormalizedEmail } from "../_shared/parser.ts";
 import { parsePaymentNotification } from "../_shared/parser.ts";
 import { readPubSubNotification } from "../_shared/pubsub.ts";
 import { gmailHistoryParameters } from "../_shared/sync.ts";
+import { parseSyntheticPaymentFixture } from "./synthetic-parser.ts";
 
 async function fixture(name: string): Promise<NormalizedEmail> {
   const path = new URL(`../../../fixtures/gmail/${name}`, import.meta.url);
@@ -35,7 +36,7 @@ async function fixture(name: string): Promise<NormalizedEmail> {
 }
 
 Deno.test("synthetic completed deposit fixture parses deterministically", async () => {
-  const result = await parsePaymentNotification(
+  const result = await parseSyntheticPaymentFixture(
     await fixture("synthetic-deposit-completed.json"),
   );
   assertEquals(result.outcome, "parsed");
@@ -47,13 +48,20 @@ Deno.test("synthetic completed deposit fixture parses deterministically", async 
 });
 
 Deno.test("synthetic reversal always requires reconciliation review", async () => {
-  const result = await parsePaymentNotification(
+  const result = await parseSyntheticPaymentFixture(
     await fixture("synthetic-reversal.json"),
   );
   assertEquals(result.outcome, "parsed");
   if (result.outcome === "parsed") {
     assertEquals(result.eventType, "deposit_reversed");
   }
+});
+
+Deno.test("deployed intake cannot activate the synthetic fixture grammar", async () => {
+  const result = await parsePaymentNotification(
+    await fixture("synthetic-deposit-completed.json"),
+  );
+  assertEquals(result.outcome, "unsupported");
 });
 
 Deno.test("suspected provider content without an approved parser is unsupported", async () => {

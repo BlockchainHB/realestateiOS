@@ -19,10 +19,10 @@ Recorded on 2026-08-06 against branch `hasaam/supabase-google-oauth-foundation`.
 | Schema lint | `supabase db lint --local --schema public,private --level warning --fail-on error` | Pass; no schema errors in the application-owned schemas. The extension schema is excluded because pgTAP's own compatibility warnings are not application code. |
 | Security advisor | `supabase db advisors --local --type security --level info --fail-on error` | Pass; no error-level findings. The four informational no-policy findings are the intentionally inaccessible, forced-RLS tables in the non-exposed `private` schema. |
 | Performance advisor | `supabase db advisors --local --type performance --level info --fail-on error` | Pass at the error threshold; no unindexed foreign keys remain. A freshly reset database reports the new and query-path indexes as unused until representative traffic exists. |
-| Function formatting | `deno fmt --check supabase/functions` | Pass; 26 files checked. |
+| Function formatting | `deno fmt --check supabase/functions` | Pass; 27 files checked. |
 | Function type checks | `deno check --config supabase/functions/<function>/deno.json supabase/functions/<function>/index.ts` | Pass for all five Edge Functions. |
-| Edge unit tests | `deno test --allow-env --allow-read=fixtures/gmail --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/parser_test.ts` | Pass; 13 tests. |
-| Database concurrency | `SUPABASE_DB_URL=<local-db-url> deno test --allow-env --allow-net=127.0.0.1:54322 --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/database_concurrency_test.ts` | Pass; three race/recovery tests cover last-owner serialization, disconnect winning over token refresh, and stale Pub/Sub receipt reclamation. |
+| Edge unit tests | `deno test --allow-env --allow-read=fixtures/gmail --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/parser_test.ts` | Pass; 14 tests. |
+| Database concurrency | `SUPABASE_DB_URL=<local-db-url> deno test --allow-env --allow-net=127.0.0.1:54322 --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/database_concurrency_test.ts` | Pass; four race/recovery tests cover last-owner serialization, disconnect winning over token refresh, stale Pub/Sub receipt reclamation, and final-organization provider cleanup. |
 | Whitespace | `git diff --check` | Pass. |
 
 The database suite covers owner, manager, active tenant, former tenant, outsider,
@@ -32,6 +32,8 @@ handling, OAuth PKCE and exact-scope parameters, authenticated encryption and
 tamper detection, Pub/Sub envelope validation, and constant-time secret checks.
 Gmail synchronization tests also pin the INBOX history filter and the single
 refresh-and-retry path for nominally unexpired access tokens rejected with 401.
+The production parser boundary is also verified to reject the test-only
+synthetic fixture grammar as unsupported.
 Database race coverage also verifies that a completed refresh cannot restore
 credentials after disconnect and that abandoned notification work is reclaimed
 only after its processing lease expires.
