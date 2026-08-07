@@ -22,7 +22,7 @@ Recorded on 2026-08-06 against branch `hasaam/supabase-google-oauth-foundation`.
 | Function formatting | `deno fmt --check supabase/functions` | Pass; 27 files checked. |
 | Function type checks | `deno check --config supabase/functions/<function>/deno.json supabase/functions/<function>/index.ts` | Pass for all five Edge Functions. |
 | Edge unit tests | `deno test --allow-env --allow-read=fixtures/gmail --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/parser_test.ts` | Pass; 15 tests. |
-| Database concurrency | `SUPABASE_DB_URL=<local-db-url> deno test --allow-env --allow-net=127.0.0.1:54322 --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/database_concurrency_test.ts` | Pass; five race/recovery tests cover last-owner serialization, disconnect winning over token refresh, stale Pub/Sub receipt reclamation, final-organization provider cleanup, failed-callback preservation of shared access, and rejection of overlapping provider setup. |
+| Database concurrency | `SUPABASE_DB_URL=<local-db-url> deno test --allow-env --allow-net=127.0.0.1:54322 --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/database_concurrency_test.ts` | Pass; six race/recovery tests cover last-owner serialization, disconnect winning over token refresh, stale Pub/Sub receipt reclamation, final-organization provider cleanup, failed-callback preservation of shared access, rejection of overlapping provider setup, and serialization of maintenance renewal with final disconnect. |
 | Whitespace | `git diff --check` | Pass. |
 
 The database suite covers owner, manager, active tenant, former tenant, outsider,

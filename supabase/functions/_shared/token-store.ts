@@ -73,8 +73,8 @@ export async function consumeAuthorizationState(
 
 export async function loadToken(
   connectionId: string,
+  sql = database(),
 ): Promise<GoogleTokenBundle | null> {
-  const sql = database();
   const rows = await sql<{ token_ciphertext: string }[]>`
     select token_ciphertext
     from private.gmail_oauth_tokens

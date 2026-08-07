@@ -20,6 +20,17 @@ interface HistoryResponse {
   nextPageToken?: string;
 }
 
+interface WatchRenewalDependencies {
+  sql?: ReturnType<typeof database>;
+  startWatch?: (
+    bundle: GoogleTokenBundle,
+  ) => Promise<{ historyId: string; expiration: string }>;
+  synchronize?: (
+    connectionId: string,
+    notifiedHistoryId?: string,
+  ) => Promise<{ processed: number; cursor: string | null }>;
+}
+
 function maxHistoryId(
   ...values: Array<string | null | undefined>
 ): string | null {
@@ -47,10 +58,11 @@ export function gmailHistoryParameters(
 async function refreshConnectionToken(
   connectionId: string,
   bundle: GoogleTokenBundle,
+  sql = database(),
 ): Promise<GoogleTokenBundle> {
   try {
     const refreshed = await refreshGoogleToken(bundle);
-    if (!await saveToken(connectionId, refreshed)) {
+    if (!await saveToken(connectionId, refreshed, sql)) {
       throw new HttpError(
         409,
         "gmail_not_connected",
@@ -62,6 +74,7 @@ async function refreshConnectionToken(
     await markConnectionNeedsReauthorization(
       connectionId,
       "token_refresh_failed",
+      sql,
     );
     throw error;
   }
@@ -70,8 +83,9 @@ async function refreshConnectionToken(
 async function markConnectionNeedsReauthorization(
   connectionId: string,
   errorCode: string,
+  sql = database(),
 ): Promise<void> {
-  await database()`
+  await sql`
     update public.gmail_connections
     set status = 'needs_reauthorization',
         needs_reauthorization_at = coalesce(needs_reauthorization_at, now()),
@@ -85,19 +99,20 @@ async function requestConnectionGmail<T>(
   connectionId: string,
   bundle: GoogleTokenBundle,
   request: (currentBundle: GoogleTokenBundle) => Promise<T>,
+  sql = database(),
 ): Promise<{ bundle: GoogleTokenBundle; result: T }> {
   try {
     return await gmailRequestWithRefresh(
       bundle,
       request,
-      (staleBundle) => refreshConnectionToken(connectionId, staleBundle),
+      (staleBundle) => refreshConnectionToken(connectionId, staleBundle, sql),
     );
   } catch (error) {
     if (
       error instanceof HttpError &&
       error.code === "gmail_reauthorization_required"
     ) {
-      await markConnectionNeedsReauthorization(connectionId, error.code);
+      await markConnectionNeedsReauthorization(connectionId, error.code, sql);
     }
     throw error;
   }
@@ -105,8 +120,9 @@ async function requestConnectionGmail<T>(
 
 export async function freshConnectionToken(
   connectionId: string,
+  sql = database(),
 ): Promise<GoogleTokenBundle> {
-  const bundle = await loadToken(connectionId);
+  const bundle = await loadToken(connectionId, sql);
   if (!bundle) {
     throw new HttpError(
       409,
@@ -115,7 +131,7 @@ export async function freshConnectionToken(
     );
   }
   if (Date.parse(bundle.expiresAt) > Date.now() + 120_000) return bundle;
-  return await refreshConnectionToken(connectionId, bundle);
+  return await refreshConnectionToken(connectionId, bundle, sql);
 }
 
 export async function synchronizeConnection(
@@ -142,7 +158,7 @@ export async function synchronizeConnection(
       "The Gmail connection was not found.",
     );
   }
-  let bundle = await freshConnectionToken(connectionId);
+  let bundle = await freshConnectionToken(connectionId, sql);
   const requestGmail = async <T>(
     request: (currentBundle: GoogleTokenBundle) => Promise<T>,
   ): Promise<T> => {
@@ -150,6 +166,7 @@ export async function synchronizeConnection(
       connectionId,
       bundle,
       request,
+      sql,
     );
     bundle = response.bundle;
     return response.result;
@@ -267,22 +284,60 @@ export async function synchronizeConnection(
 
 export async function renewConnectionWatch(
   connectionId: string,
+  dependencies: WatchRenewalDependencies = {},
 ): Promise<void> {
-  const bundle = await freshConnectionToken(connectionId);
-  const response = await requestConnectionGmail(
-    connectionId,
-    bundle,
-    startGmailWatch,
-  );
-  const watch = response.result;
-  await database()`
-    update public.gmail_sync_states
-    set last_history_id = coalesce(last_history_id, ${watch.historyId}),
-        watch_expiration = to_timestamp(${watch.expiration}::numeric / 1000),
-        status = 'idle',
-        consecutive_failures = 0,
-        updated_at = now()
-    where connection_id = ${connectionId}
-  `;
-  await synchronizeConnection(connectionId, watch.historyId);
+  const sql = dependencies.sql ?? database();
+  const renewWatch = dependencies.startWatch ?? startGmailWatch;
+  const synchronize = dependencies.synchronize ?? synchronizeConnection;
+  const watch = await sql.begin(async (transaction) => {
+    const targets = await transaction<{ provider_account_id: string }[]>`
+      select provider_account_id
+      from public.gmail_connections
+      where id = ${connectionId}
+    `;
+    const providerAccountId = targets[0]?.provider_account_id;
+    if (!providerAccountId) {
+      throw new HttpError(
+        404,
+        "gmail_connection_not_found",
+        "The Gmail connection was not found.",
+      );
+    }
+    await transaction`
+      select pg_advisory_xact_lock(hashtextextended(${providerAccountId}, 0))
+    `;
+    const activeConnections = await transaction<{ id: string }[]>`
+      select id
+      from public.gmail_connections
+      where id = ${connectionId}
+        and status <> 'disconnected'
+    `;
+    if (!activeConnections[0]) {
+      throw new HttpError(
+        409,
+        "gmail_not_connected",
+        "The organization has no usable Gmail authorization.",
+      );
+    }
+
+    const bundle = await freshConnectionToken(connectionId, sql);
+    const response = await requestConnectionGmail(
+      connectionId,
+      bundle,
+      renewWatch,
+      sql,
+    );
+    const renewedWatch = response.result;
+    await transaction`
+      update public.gmail_sync_states
+      set last_history_id = coalesce(last_history_id, ${renewedWatch.historyId}),
+          watch_expiration = to_timestamp(${renewedWatch.expiration}::numeric / 1000),
+          status = 'idle',
+          consecutive_failures = 0,
+          updated_at = now()
+      where connection_id = ${connectionId}
+    `;
+    return renewedWatch;
+  });
+  await synchronize(connectionId, watch.historyId);
 }

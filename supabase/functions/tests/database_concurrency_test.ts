@@ -8,6 +8,7 @@ import {
 import { HttpError } from "../_shared/http.ts";
 import { claimNotificationReceipt } from "../_shared/notification-receipts.ts";
 import { saveToken } from "../_shared/token-store.ts";
+import { renewConnectionWatch } from "../_shared/sync.ts";
 
 const databaseUrl = Deno.env.get("SUPABASE_DB_URL");
 if (!databaseUrl) throw new Error("SUPABASE_DB_URL is required");
@@ -451,6 +452,155 @@ Deno.test("overlapping provider setup is rejected before a watch can start", asy
         where id = ${firstConnectionId}
       `.catch(() => undefined);
     }
+    await sql.end();
+  }
+});
+
+Deno.test("watch renewal serializes with final mailbox disconnect", async () => {
+  const sql = postgres(databaseUrl, { max: 3 });
+  const connectionId = "f8000000-0000-0000-0000-000000000021";
+  const organizationId = "f1000000-0000-0000-0000-000000000001";
+  const ownerId = "f0000000-0000-0000-0000-000000000001";
+  const providerAccountId = "renewal-race@example.test";
+  Deno.env.set(
+    "GMAIL_TOKEN_ENCRYPTION_KEY",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+
+  let releaseWatch: (() => void) | undefined;
+  let renewal: ReturnType<typeof renewConnectionWatch> | undefined;
+  let disconnect: ReturnType<typeof disconnectMailbox> | undefined;
+  try {
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from public.gmail_sync_states
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      delete from public.gmail_connections
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      insert into public.gmail_connections (
+        id, organization_id, provider_account_id, inbox_email, connected_by
+      ) values (
+        ${connectionId}, ${organizationId}, ${providerAccountId},
+        ${providerAccountId}, ${ownerId}
+      )
+    `;
+    await sql`
+      insert into public.gmail_sync_states (
+        connection_id, organization_id, last_history_id, watch_expiration
+      ) values (
+        ${connectionId}, ${organizationId}, '901', now() + interval '1 day'
+      )
+    `;
+    assertEquals(
+      await saveToken(connectionId, {
+        accessToken: "synthetic-renewal-access",
+        refreshToken: "synthetic-renewal-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      }, sql),
+      true,
+    );
+
+    const holdWatch = new Promise<void>((resolve) => {
+      releaseWatch = resolve;
+    });
+    let watchStarted!: () => void;
+    const renewalHasProviderLock = new Promise<void>((resolve) => {
+      watchStarted = resolve;
+    });
+    let watchCalls = 0;
+    renewal = renewConnectionWatch(connectionId, {
+      sql,
+      startWatch: async () => {
+        watchCalls += 1;
+        watchStarted();
+        await holdWatch;
+        return { historyId: "902", expiration: "1893456000000" };
+      },
+      synchronize: (_connectionId, notifiedHistoryId) =>
+        Promise.resolve({ processed: 0, cursor: notifiedHistoryId ?? null }),
+    });
+    await renewalHasProviderLock;
+
+    let disconnectSettled = false;
+    disconnect = disconnectMailbox({
+      connectionId,
+      organizationId,
+      userId: ownerId,
+      refreshToken: null,
+    }, sql).finally(() => {
+      disconnectSettled = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    assertEquals(disconnectSettled, false);
+
+    releaseWatch?.();
+    await renewal;
+    await disconnect;
+    assertEquals(watchCalls, 1);
+    const connections = await sql<{ status: string }[]>`
+      select status
+      from public.gmail_connections
+      where id = ${connectionId}
+    `;
+    assertEquals(connections[0]?.status, "disconnected");
+    const retryAfterDisconnect = await renewConnectionWatch(connectionId, {
+      sql,
+      startWatch: async () => {
+        watchCalls += 1;
+        return { historyId: "903", expiration: "1893456000000" };
+      },
+      synchronize: (_connectionId, notifiedHistoryId) =>
+        Promise.resolve({ processed: 0, cursor: notifiedHistoryId ?? null }),
+    }).then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error }),
+    );
+    assertEquals(retryAfterDisconnect.error instanceof HttpError, true);
+    assertEquals(
+      retryAfterDisconnect.error instanceof HttpError
+        ? retryAfterDisconnect.error.code
+        : null,
+      "gmail_not_connected",
+    );
+    assertEquals(watchCalls, 1);
+  } finally {
+    releaseWatch?.();
+    await renewal?.catch(() => undefined);
+    await disconnect?.catch(() => undefined);
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_sync_states
+      where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_connections
+      where id = ${connectionId}
+    `.catch(() => undefined);
     await sql.end();
   }
 });
