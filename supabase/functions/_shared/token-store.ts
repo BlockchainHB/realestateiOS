@@ -2,6 +2,11 @@ import { decryptJson, encryptJson, sha256Hex } from "./crypto.ts";
 import { database } from "./database.ts";
 import type { GoogleTokenBundle } from "./oauth.ts";
 
+export interface StoredGoogleToken {
+  bundle: GoogleTokenBundle;
+  authorizationGeneration: number;
+}
+
 export interface OAuthAuthorizationState {
   organizationId: string;
   userId: string;
@@ -105,15 +110,21 @@ export async function consumeAuthorizationState(
 export async function loadToken(
   connectionId: string,
   sql = database(),
-): Promise<GoogleTokenBundle | null> {
-  const rows = await sql<{ token_ciphertext: string }[]>`
-    select token_ciphertext
+): Promise<StoredGoogleToken | null> {
+  const rows = await sql<{
+    token_ciphertext: string;
+    authorization_generation: number | string;
+  }[]>`
+    select token_ciphertext, authorization_generation
     from private.gmail_oauth_tokens
     where connection_id = ${connectionId}
   `;
-  return rows[0]
-    ? await decryptJson<GoogleTokenBundle>(rows[0].token_ciphertext)
-    : null;
+  const row = rows[0];
+  if (!row) return null;
+  return {
+    bundle: await decryptJson<GoogleTokenBundle>(row.token_ciphertext),
+    authorizationGeneration: Number(row.authorization_generation),
+  };
 }
 
 export async function saveToken(
@@ -148,8 +159,41 @@ export async function saveToken(
       set token_ciphertext = excluded.token_ciphertext,
           access_token_expires_at = excluded.access_token_expires_at,
           granted_scopes = excluded.granted_scopes,
+          authorization_generation =
+            private.gmail_oauth_tokens.authorization_generation + 1,
           updated_at = now()
     `;
     return true;
+  });
+}
+
+export async function saveRefreshedToken(
+  connectionId: string,
+  bundle: GoogleTokenBundle,
+  expectedAuthorizationGeneration: number,
+  sql = database(),
+): Promise<boolean> {
+  const ciphertext = await encryptJson(bundle);
+  return await sql.begin(async (transaction) => {
+    const activeConnections = await transaction<{ id: string }[]>`
+      select id
+      from public.gmail_connections
+      where id = ${connectionId}
+        and status <> 'disconnected'
+      for update
+    `;
+    if (!activeConnections[0]) return false;
+
+    const updated = await transaction<{ connection_id: string }[]>`
+      update private.gmail_oauth_tokens
+      set token_ciphertext = ${ciphertext},
+          access_token_expires_at = ${bundle.expiresAt},
+          granted_scopes = ${bundle.scopes},
+          updated_at = now()
+      where connection_id = ${connectionId}
+        and authorization_generation = ${expectedAuthorizationGeneration}
+      returning connection_id
+    `;
+    return Boolean(updated[0]);
   });
 }

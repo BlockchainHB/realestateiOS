@@ -9,7 +9,11 @@ import {
   startGmailWatch,
 } from "./oauth.ts";
 import { ingestEmailSourceEvent } from "./source-events.ts";
-import { loadToken, saveToken } from "./token-store.ts";
+import {
+  loadToken,
+  saveRefreshedToken,
+  type StoredGoogleToken,
+} from "./token-store.ts";
 
 interface HistoryResponse {
   history?: Array<{
@@ -191,19 +195,12 @@ export async function collectGmailChanges(
 
 async function refreshConnectionToken(
   connectionId: string,
-  bundle: GoogleTokenBundle,
+  token: StoredGoogleToken,
   sql = database(),
-): Promise<GoogleTokenBundle> {
+): Promise<StoredGoogleToken> {
+  let refreshed: GoogleTokenBundle;
   try {
-    const refreshed = await refreshGoogleToken(bundle);
-    if (!await saveToken(connectionId, refreshed, sql)) {
-      throw new HttpError(
-        409,
-        "gmail_not_connected",
-        "The Gmail connection was disconnected while access was refreshing.",
-      );
-    }
-    return refreshed;
+    refreshed = await refreshGoogleToken(token.bundle);
   } catch (error) {
     await markConnectionNeedsReauthorization(
       connectionId,
@@ -212,6 +209,25 @@ async function refreshConnectionToken(
     );
     throw error;
   }
+
+  if (
+    !await saveRefreshedToken(
+      connectionId,
+      refreshed,
+      token.authorizationGeneration,
+      sql,
+    )
+  ) {
+    throw new HttpError(
+      409,
+      "gmail_token_generation_changed",
+      "The Gmail authorization changed while access was refreshing.",
+    );
+  }
+  return {
+    bundle: refreshed,
+    authorizationGeneration: token.authorizationGeneration,
+  };
 }
 
 async function markConnectionNeedsReauthorization(
@@ -231,16 +247,28 @@ async function markConnectionNeedsReauthorization(
 
 async function requestConnectionGmail<T>(
   connectionId: string,
-  bundle: GoogleTokenBundle,
+  token: StoredGoogleToken,
   request: (currentBundle: GoogleTokenBundle) => Promise<T>,
   sql = database(),
-): Promise<{ bundle: GoogleTokenBundle; result: T }> {
+): Promise<{ token: StoredGoogleToken; result: T }> {
   try {
-    return await gmailRequestWithRefresh(
-      bundle,
+    let currentToken = token;
+    const response = await gmailRequestWithRefresh(
+      token.bundle,
       request,
-      (staleBundle) => refreshConnectionToken(connectionId, staleBundle, sql),
+      async () => {
+        currentToken = await refreshConnectionToken(
+          connectionId,
+          currentToken,
+          sql,
+        );
+        return currentToken.bundle;
+      },
     );
+    return {
+      token: { ...currentToken, bundle: response.bundle },
+      result: response.result,
+    };
   } catch (error) {
     if (
       error instanceof HttpError &&
@@ -255,17 +283,17 @@ async function requestConnectionGmail<T>(
 export async function freshConnectionToken(
   connectionId: string,
   sql = database(),
-): Promise<GoogleTokenBundle> {
-  const bundle = await loadToken(connectionId, sql);
-  if (!bundle) {
+): Promise<StoredGoogleToken> {
+  const token = await loadToken(connectionId, sql);
+  if (!token) {
     throw new HttpError(
       409,
       "gmail_not_connected",
       "The organization has no usable Gmail authorization.",
     );
   }
-  if (Date.parse(bundle.expiresAt) > Date.now() + 120_000) return bundle;
-  return await refreshConnectionToken(connectionId, bundle, sql);
+  if (Date.parse(token.bundle.expiresAt) > Date.now() + 120_000) return token;
+  return await refreshConnectionToken(connectionId, token, sql);
 }
 
 export async function synchronizeConnection(
@@ -296,17 +324,17 @@ export async function synchronizeConnection(
       "The Gmail connection was not found.",
     );
   }
-  let bundle = await freshConnectionToken(connectionId, sql);
+  let token = await freshConnectionToken(connectionId, sql);
   const requestGmail = async <T>(
     request: (currentBundle: GoogleTokenBundle) => Promise<T>,
   ): Promise<T> => {
     const response = await requestConnectionGmail(
       connectionId,
-      bundle,
+      token,
       request,
       sql,
     );
-    bundle = response.bundle;
+    token = response.token;
     return response.result;
   };
   const requestGmailPath: GmailRequester = <T>(
@@ -394,6 +422,7 @@ export async function synchronizeConnection(
       update public.gmail_connections
       set status = case
             when status = 'needs_reauthorization' then status
+            when ${errorCode} = 'gmail_token_generation_changed' then status
             when ${errorCode} = 'gmail_reauthorization_required' then 'needs_reauthorization'
             else 'sync_delayed'
           end,
@@ -402,7 +431,11 @@ export async function synchronizeConnection(
               then coalesce(needs_reauthorization_at, now())
             else needs_reauthorization_at
           end,
-          last_error_code = ${errorCode}
+          last_error_code = case
+            when ${errorCode} = 'gmail_token_generation_changed'
+              then last_error_code
+            else ${errorCode}
+          end
       where id = ${connectionId}
         and status <> 'disconnected'
     `;
@@ -448,10 +481,10 @@ export async function renewConnectionWatch(
       );
     }
 
-    const bundle = await freshConnectionToken(connectionId, sql);
+    const token = await freshConnectionToken(connectionId, sql);
     const response = await requestConnectionGmail(
       connectionId,
-      bundle,
+      token,
       renewWatch,
       sql,
     );

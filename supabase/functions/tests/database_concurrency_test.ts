@@ -7,7 +7,11 @@ import {
 } from "../_shared/connections.ts";
 import { HttpError } from "../_shared/http.ts";
 import { claimNotificationReceipt } from "../_shared/notification-receipts.ts";
-import { saveToken } from "../_shared/token-store.ts";
+import {
+  loadToken,
+  saveRefreshedToken,
+  saveToken,
+} from "../_shared/token-store.ts";
 import { renewConnectionWatch } from "../_shared/sync.ts";
 
 const databaseUrl = Deno.env.get("SUPABASE_DB_URL");
@@ -1021,6 +1025,81 @@ Deno.test("disconnect cancels an OAuth callback before its connection row exists
     await sql`
       delete from public.gmail_connections
       where organization_id = ${organizationId}
+    `.catch(() => undefined);
+    await sql.end();
+  }
+});
+
+Deno.test("stale token refresh cannot overwrite a newer authorization", async () => {
+  const sql = postgres(databaseUrl, { max: 3 });
+  const connectionId = "f8000000-0000-0000-0000-000000000033";
+  const organizationId = "f1000000-0000-0000-0000-000000000001";
+  const ownerId = "f0000000-0000-0000-0000-000000000001";
+
+  try {
+    await sql`
+      insert into public.gmail_connections (
+        id, organization_id, provider_account_id, inbox_email, connected_by
+      ) values (
+        ${connectionId}, ${organizationId}, 'generation-race@example.test',
+        'generation-race@example.test', ${ownerId}
+      )
+    `;
+    assertEquals(
+      await saveToken(connectionId, {
+        accessToken: "synthetic-original-access",
+        refreshToken: "synthetic-original-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      }, sql),
+      true,
+    );
+    const staleToken = await loadToken(connectionId, sql);
+    if (!staleToken) throw new Error("Expected the original token");
+
+    assertEquals(
+      await saveToken(connectionId, {
+        accessToken: "synthetic-reauthorized-access",
+        refreshToken: "synthetic-reauthorized-refresh",
+        expiresAt: new Date(Date.now() + 7_200_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      }, sql),
+      true,
+    );
+    assertEquals(
+      await saveRefreshedToken(
+        connectionId,
+        {
+          accessToken: "synthetic-stale-refreshed-access",
+          refreshToken: "synthetic-original-refresh",
+          expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+          scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+        },
+        staleToken.authorizationGeneration,
+        sql,
+      ),
+      false,
+    );
+
+    const retainedToken = await loadToken(connectionId, sql);
+    assertEquals(
+      retainedToken?.authorizationGeneration,
+      staleToken.authorizationGeneration + 1,
+    );
+    assertEquals(
+      retainedToken?.bundle.accessToken,
+      "synthetic-reauthorized-access",
+    );
+    assertEquals(
+      retainedToken?.bundle.refreshToken,
+      "synthetic-reauthorized-refresh",
+    );
+  } finally {
+    await sql`
+      delete from private.gmail_oauth_tokens where connection_id = ${connectionId}
+    `.catch(() => undefined);
+    await sql`
+      delete from public.gmail_connections where id = ${connectionId}
     `.catch(() => undefined);
     await sql.end();
   }

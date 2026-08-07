@@ -222,6 +222,8 @@ export async function connectMailbox(input: {
       set token_ciphertext = excluded.token_ciphertext,
           access_token_expires_at = excluded.access_token_expires_at,
           granted_scopes = excluded.granted_scopes,
+          authorization_generation =
+            private.gmail_oauth_tokens.authorization_generation + 1,
           updated_at = now()
     `;
 
