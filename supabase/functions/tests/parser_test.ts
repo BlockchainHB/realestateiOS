@@ -177,8 +177,8 @@ Deno.test("Gmail history synchronization is scoped to the watched inbox", () => 
 });
 
 Deno.test("expired Gmail history uses a bounded candidate recovery scan", async () => {
-  const lastSuccessfulSyncAt = "2030-01-01T00:00:00.000Z";
-  const recovery = gmailRecoveryParameters(lastSuccessfulSyncAt, "page-2");
+  const lastHistorySnapshotAt = "2030-01-01T00:00:00.000Z";
+  const recovery = gmailRecoveryParameters(lastHistorySnapshotAt, "page-2");
   assertEquals(recovery.get("labelIds"), "INBOX");
   assertEquals(recovery.get("maxResults"), "500");
   assertEquals(recovery.get("pageToken"), "page-2");
@@ -191,7 +191,7 @@ Deno.test("expired Gmail history uses a bounded candidate recovery scan", async 
   const changes = await collectGmailChanges(
     "101",
     "905",
-    lastSuccessfulSyncAt,
+    lastHistorySnapshotAt,
     <T>(path: string): Promise<T> => {
       requestedPaths.push(path);
       const url = new URL(`https://gmail.example.test${path}`);

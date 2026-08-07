@@ -76,16 +76,16 @@ export function gmailHistoryParameters(
 }
 
 export function gmailRecoveryParameters(
-  lastSuccessfulSyncAt: string | null,
+  lastHistorySnapshotAt: string | null,
   pageToken?: string,
 ): URLSearchParams {
   const candidateQuery =
     '{from:interac subject:interac from:"e-transfer" subject:"e-transfer"}';
-  const lastSuccessfulSyncTime = lastSuccessfulSyncAt
-    ? Date.parse(lastSuccessfulSyncAt)
+  const lastHistorySnapshotTime = lastHistorySnapshotAt
+    ? Date.parse(lastHistorySnapshotAt)
     : Number.NaN;
-  const after = Number.isFinite(lastSuccessfulSyncTime)
-    ? ` after:${Math.max(0, Math.floor(lastSuccessfulSyncTime / 1_000) - 1)}`
+  const after = Number.isFinite(lastHistorySnapshotTime)
+    ? ` after:${Math.max(0, Math.floor(lastHistorySnapshotTime / 1_000) - 1)}`
     : "";
   const parameters = new URLSearchParams({
     labelIds: "INBOX",
@@ -132,7 +132,7 @@ async function collectIncrementalChanges(
 export async function collectGmailChanges(
   startHistoryId: string,
   notifiedHistoryId: string | undefined,
-  lastSuccessfulSyncAt: string | null,
+  lastHistorySnapshotAt: string | null,
   requestGmail: GmailRequester,
 ): Promise<GmailChangeSet> {
   try {
@@ -162,7 +162,7 @@ export async function collectGmailChanges(
   let pageToken: string | undefined;
   do {
     const parameters = gmailRecoveryParameters(
-      lastSuccessfulSyncAt,
+      lastHistorySnapshotAt,
       pageToken,
     );
     const page = await requestGmail<MessageListResponse>(
@@ -276,12 +276,12 @@ export async function synchronizeConnection(
   const rows = await sql<{
     organization_id: string;
     last_history_id: string | null;
-    last_successful_sync_at: string | null;
+    last_history_snapshot_at: string;
     status: string;
   }[]>`
     select connection.organization_id,
            state.last_history_id,
-           connection.last_successful_sync_at,
+           state.last_history_snapshot_at,
            connection.status
     from public.gmail_connections connection
     join public.gmail_sync_states state on state.connection_id = connection.id
@@ -326,10 +326,11 @@ export async function synchronizeConnection(
     where connection_id = ${connectionId}
   `;
   try {
+    const historySnapshotStartedAt = new Date().toISOString();
     const changes = await collectGmailChanges(
       connection.last_history_id,
       notifiedHistoryId,
-      connection.last_successful_sync_at,
+      connection.last_history_snapshot_at,
       requestGmailPath,
     );
     const cursor = changes.cursor;
@@ -365,6 +366,7 @@ export async function synchronizeConnection(
             when ${cursor}::numeric > last_history_id::numeric then ${cursor}
             else last_history_id
           end,
+          last_history_snapshot_at = ${historySnapshotStartedAt},
           status = 'idle',
           consecutive_failures = 0,
           updated_at = now()
