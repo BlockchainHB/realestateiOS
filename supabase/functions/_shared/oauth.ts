@@ -176,6 +176,25 @@ export async function gmailApi<T>(
   return await response.json() as T;
 }
 
+export async function gmailRequestWithRefresh<T>(
+  bundle: GoogleTokenBundle,
+  request: (currentBundle: GoogleTokenBundle) => Promise<T>,
+  refresh: (staleBundle: GoogleTokenBundle) => Promise<GoogleTokenBundle>,
+): Promise<{ bundle: GoogleTokenBundle; result: T }> {
+  try {
+    return { bundle, result: await request(bundle) };
+  } catch (error) {
+    if (
+      !(error instanceof HttpError) ||
+      error.code !== "gmail_reauthorization_required"
+    ) {
+      throw error;
+    }
+    const refreshed = await refresh(bundle);
+    return { bundle: refreshed, result: await request(refreshed) };
+  }
+}
+
 export async function readGoogleMailboxIdentity(
   bundle: GoogleTokenBundle,
 ): Promise<{

@@ -3,6 +3,7 @@ import { getNormalizedEmail } from "./gmail-message.ts";
 import { HttpError } from "./http.ts";
 import {
   gmailApi,
+  gmailRequestWithRefresh,
   type GoogleTokenBundle,
   refreshGoogleToken,
   startGmailWatch,
@@ -29,6 +30,79 @@ function maxHistoryId(
   );
 }
 
+export function gmailHistoryParameters(
+  startHistoryId: string,
+  pageToken?: string,
+): URLSearchParams {
+  const parameters = new URLSearchParams({
+    startHistoryId,
+    historyTypes: "messageAdded",
+    labelId: "INBOX",
+    maxResults: "100",
+  });
+  if (pageToken) parameters.set("pageToken", pageToken);
+  return parameters;
+}
+
+async function refreshConnectionToken(
+  connectionId: string,
+  bundle: GoogleTokenBundle,
+): Promise<GoogleTokenBundle> {
+  try {
+    const refreshed = await refreshGoogleToken(bundle);
+    if (!await saveToken(connectionId, refreshed)) {
+      throw new HttpError(
+        409,
+        "gmail_not_connected",
+        "The Gmail connection was disconnected while access was refreshing.",
+      );
+    }
+    return refreshed;
+  } catch (error) {
+    await markConnectionNeedsReauthorization(
+      connectionId,
+      "token_refresh_failed",
+    );
+    throw error;
+  }
+}
+
+async function markConnectionNeedsReauthorization(
+  connectionId: string,
+  errorCode: string,
+): Promise<void> {
+  await database()`
+    update public.gmail_connections
+    set status = 'needs_reauthorization',
+        needs_reauthorization_at = coalesce(needs_reauthorization_at, now()),
+        last_error_code = ${errorCode}
+    where id = ${connectionId}
+      and status <> 'disconnected'
+  `;
+}
+
+async function requestConnectionGmail<T>(
+  connectionId: string,
+  bundle: GoogleTokenBundle,
+  request: (currentBundle: GoogleTokenBundle) => Promise<T>,
+): Promise<{ bundle: GoogleTokenBundle; result: T }> {
+  try {
+    return await gmailRequestWithRefresh(
+      bundle,
+      request,
+      (staleBundle) => refreshConnectionToken(connectionId, staleBundle),
+    );
+  } catch (error) {
+    if (
+      error instanceof HttpError &&
+      error.code === "gmail_reauthorization_required"
+    ) {
+      await markConnectionNeedsReauthorization(connectionId, error.code);
+    }
+    throw error;
+  }
+}
+
 export async function freshConnectionToken(
   connectionId: string,
 ): Promise<GoogleTokenBundle> {
@@ -41,27 +115,7 @@ export async function freshConnectionToken(
     );
   }
   if (Date.parse(bundle.expiresAt) > Date.now() + 120_000) return bundle;
-  try {
-    const refreshed = await refreshGoogleToken(bundle);
-    if (!await saveToken(connectionId, refreshed)) {
-      throw new HttpError(
-        409,
-        "gmail_not_connected",
-        "The Gmail connection was disconnected while access was refreshing.",
-      );
-    }
-    return refreshed;
-  } catch (error) {
-    await database()`
-      update public.gmail_connections
-      set status = 'needs_reauthorization',
-          needs_reauthorization_at = now(),
-          last_error_code = 'token_refresh_failed'
-      where id = ${connectionId}
-        and status <> 'disconnected'
-    `;
-    throw error;
-  }
+  return await refreshConnectionToken(connectionId, bundle);
 }
 
 export async function synchronizeConnection(
@@ -88,7 +142,18 @@ export async function synchronizeConnection(
       "The Gmail connection was not found.",
     );
   }
-  const bundle = await freshConnectionToken(connectionId);
+  let bundle = await freshConnectionToken(connectionId);
+  const requestGmail = async <T>(
+    request: (currentBundle: GoogleTokenBundle) => Promise<T>,
+  ): Promise<T> => {
+    const response = await requestConnectionGmail(
+      connectionId,
+      bundle,
+      request,
+    );
+    bundle = response.bundle;
+    return response.result;
+  };
   if (!connection.last_history_id) {
     return { processed: 0, cursor: notifiedHistoryId ?? null };
   }
@@ -103,15 +168,15 @@ export async function synchronizeConnection(
     let cursor = maxHistoryId(connection.last_history_id, notifiedHistoryId);
     const messageIds = new Set<string>();
     do {
-      const params = new URLSearchParams({
-        startHistoryId: connection.last_history_id,
-        historyTypes: "messageAdded",
-        maxResults: "100",
-      });
-      if (pageToken) params.set("pageToken", pageToken);
-      const history = await gmailApi<HistoryResponse>(
-        bundle,
-        `/history?${params.toString()}`,
+      const params = gmailHistoryParameters(
+        connection.last_history_id,
+        pageToken,
+      );
+      const history = await requestGmail((currentBundle) =>
+        gmailApi<HistoryResponse>(
+          currentBundle,
+          `/history?${params.toString()}`,
+        )
       );
       cursor = maxHistoryId(
         cursor,
@@ -130,7 +195,9 @@ export async function synchronizeConnection(
     for (const messageId of messageIds) {
       let email: Awaited<ReturnType<typeof getNormalizedEmail>>;
       try {
-        email = await getNormalizedEmail(bundle, messageId);
+        email = await requestGmail((currentBundle) =>
+          getNormalizedEmail(currentBundle, messageId)
+        );
       } catch (error) {
         if (
           error instanceof HttpError && error.code === "gmail_message_not_found"
@@ -170,6 +237,7 @@ export async function synchronizeConnection(
     `;
     return { processed, cursor };
   } catch (error) {
+    const errorCode = error instanceof HttpError ? error.code : "sync_failed";
     await sql`
       update public.gmail_sync_states
       set status = 'failed',
@@ -179,10 +247,17 @@ export async function synchronizeConnection(
     `;
     await sql`
       update public.gmail_connections
-      set status = case when status = 'needs_reauthorization' then status else 'sync_delayed' end,
-          last_error_code = ${
-      error instanceof HttpError ? error.code : "sync_failed"
-    }
+      set status = case
+            when status = 'needs_reauthorization' then status
+            when ${errorCode} = 'gmail_reauthorization_required' then 'needs_reauthorization'
+            else 'sync_delayed'
+          end,
+          needs_reauthorization_at = case
+            when ${errorCode} = 'gmail_reauthorization_required'
+              then coalesce(needs_reauthorization_at, now())
+            else needs_reauthorization_at
+          end,
+          last_error_code = ${errorCode}
       where id = ${connectionId}
         and status <> 'disconnected'
     `;
@@ -194,7 +269,12 @@ export async function renewConnectionWatch(
   connectionId: string,
 ): Promise<void> {
   const bundle = await freshConnectionToken(connectionId);
-  const watch = await startGmailWatch(bundle);
+  const response = await requestConnectionGmail(
+    connectionId,
+    bundle,
+    startGmailWatch,
+  );
+  const watch = response.result;
   await database()`
     update public.gmail_sync_states
     set last_history_id = coalesce(last_history_id, ${watch.historyId}),

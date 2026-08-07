@@ -17,10 +17,12 @@ import { HttpError } from "../_shared/http.ts";
 import {
   buildGoogleAuthorizationUrl,
   disconnectGoogleAccess,
+  gmailRequestWithRefresh,
 } from "../_shared/oauth.ts";
 import type { NormalizedEmail } from "../_shared/parser.ts";
 import { parsePaymentNotification } from "../_shared/parser.ts";
 import { readPubSubNotification } from "../_shared/pubsub.ts";
+import { gmailHistoryParameters } from "../_shared/sync.ts";
 
 async function fixture(name: string): Promise<NormalizedEmail> {
   const path = new URL(`../../../fixtures/gmail/${name}`, import.meta.url);
@@ -151,6 +153,49 @@ Deno.test("maintenance secret comparison handles equal and unequal values", () =
 Deno.test("watch setup preserves an existing Gmail history cursor", () => {
   assertEquals(preservedHistoryCursor("101", "999"), "101");
   assertEquals(preservedHistoryCursor(null, "999"), "999");
+});
+
+Deno.test("Gmail history synchronization is scoped to the watched inbox", () => {
+  const parameters = gmailHistoryParameters("101", "next-page");
+  assertEquals(parameters.get("startHistoryId"), "101");
+  assertEquals(parameters.get("historyTypes"), "messageAdded");
+  assertEquals(parameters.get("labelId"), "INBOX");
+  assertEquals(parameters.get("pageToken"), "next-page");
+});
+
+Deno.test("Gmail 401 retries once with a refreshed token", async () => {
+  const staleBundle = {
+    accessToken: "synthetic-stale-access",
+    refreshToken: "synthetic-refresh",
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+    scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+  };
+  const refreshedBundle = {
+    ...staleBundle,
+    accessToken: "synthetic-refreshed-access",
+  };
+  const requestedTokens: string[] = [];
+  const response = await gmailRequestWithRefresh(
+    staleBundle,
+    (bundle) => {
+      requestedTokens.push(bundle.accessToken);
+      if (bundle.accessToken === staleBundle.accessToken) {
+        throw new HttpError(
+          401,
+          "gmail_reauthorization_required",
+          "Synthetic expired access token.",
+        );
+      }
+      return Promise.resolve("recovered");
+    },
+    () => Promise.resolve(refreshedBundle),
+  );
+  assertEquals(response.result, "recovered");
+  assertEquals(response.bundle, refreshedBundle);
+  assertEquals(requestedTokens, [
+    "synthetic-stale-access",
+    "synthetic-refreshed-access",
+  ]);
 });
 
 Deno.test("permanently unavailable Gmail messages have a skippable error identity", async () => {
