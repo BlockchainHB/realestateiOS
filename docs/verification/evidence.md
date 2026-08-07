@@ -15,14 +15,14 @@ Recorded on 2026-08-06 against branch `hasaam/supabase-google-oauth-foundation`.
 | Gate | Command | Result |
 |---|---|---|
 | Clean rebuild | `supabase db reset` | Pass; all three migrations and the synthetic seed applied to a recreated PostgreSQL 17 database. |
-| Database authorization | `supabase test db` | Pass; 50 pgTAP assertions. |
+| Database authorization | `supabase test db` | Pass; 51 pgTAP assertions. |
 | Schema lint | `supabase db lint --local --schema public,private --level warning --fail-on error` | Pass; no schema errors in the application-owned schemas. The extension schema is excluded because pgTAP's own compatibility warnings are not application code. |
-| Security advisor | `supabase db advisors --local --type security --level info --fail-on error` | Pass; no error-level findings. The four informational no-policy findings are the intentionally inaccessible, forced-RLS tables in the non-exposed `private` schema. |
+| Security advisor | `supabase db advisors --local --type security --level info --fail-on error` | Pass; no error-level findings. The five informational no-policy findings are the intentionally inaccessible, forced-RLS tables in the non-exposed `private` schema. |
 | Performance advisor | `supabase db advisors --local --type performance --level info --fail-on error` | Pass at the error threshold; no unindexed foreign keys remain. A freshly reset database reports the new and query-path indexes as unused until representative traffic exists. |
 | Function formatting | `deno fmt --check supabase/functions` | Pass; 27 files checked. |
 | Function type checks | `deno check --config supabase/functions/<function>/deno.json supabase/functions/<function>/index.ts` | Pass for all five Edge Functions. |
 | Edge unit tests | `deno test --allow-env --allow-read=fixtures/gmail --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/parser_test.ts` | Pass; 17 tests. |
-| Database concurrency | `SUPABASE_DB_URL=<local-db-url> deno test --allow-env --allow-net=127.0.0.1:54322 --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/database_concurrency_test.ts` | Pass; eight race/recovery tests cover last-owner serialization, disconnect winning over token refresh, stale Pub/Sub receipt reclamation, final-organization provider cleanup, failed-callback preservation of shared access, rejection of overlapping provider setup, serialization of maintenance renewal with final disconnect, retention of the current reauthorized grant during disconnect, and rechecking a stale disconnected snapshot after reconnect. |
+| Database concurrency | `SUPABASE_DB_URL=<local-db-url> deno test --allow-env --allow-net=127.0.0.1:54322 --config supabase/functions/gmail-oauth-start/deno.json supabase/functions/tests/database_concurrency_test.ts` | Pass; nine race/recovery tests cover last-owner serialization, disconnect winning over token refresh, stale Pub/Sub receipt reclamation, final-organization provider cleanup, failed-callback preservation of shared access, organization/provider setup serialization, maintenance renewal with final disconnect, retention of the current reauthorized grant during disconnect, rechecking a stale disconnected snapshot after reconnect, and cancelling an OAuth callback before its connection row exists. |
 | Whitespace | `git diff --check` | Pass. |
 
 The database suite covers owner, manager, active tenant, former tenant, outsider,
@@ -33,7 +33,7 @@ tamper detection, Pub/Sub envelope validation, and constant-time secret checks.
 Gmail synchronization tests also pin the INBOX history filter and the single
 refresh-and-retry path for nominally unexpired access tokens rejected with 401.
 They prove an expired history cursor performs a bounded INBOX candidate scan
-from the last successful sync and replays changes from a fresh history anchor.
+from the prior cursor snapshot and replays changes from a fresh history anchor.
 The production parser boundary is also verified to reject the test-only
 synthetic fixture grammar as unsupported.
 Database race coverage also verifies that a completed refresh cannot restore

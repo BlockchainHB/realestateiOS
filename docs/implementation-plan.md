@@ -9,7 +9,7 @@
 
 ## Module shape
 
-- SQL migrations establish public RLS-protected records and a non-exposed `private` schema for encrypted OAuth tokens, one-time authorization state, and Pub/Sub receipts.
+- SQL migrations establish public RLS-protected records and a non-exposed `private` schema for encrypted OAuth tokens, one-time authorization state, cancellable connection intents, and Pub/Sub receipts.
 - Authenticated Edge Functions start Gmail authorization and expose owner-only health/disconnect operations.
 - Public callback and Pub/Sub functions implement their own narrow trust checks: one-time state plus PKCE for OAuth, and Google-signed OIDC JWT validation for Pub/Sub.
 - Shared server modules own OAuth, envelope encryption, Gmail API access, history synchronization, a production-safe unsupported parser boundary, idempotent source-event insertion, and watch/recovery maintenance. Synthetic grammar exists only in the test tree.
