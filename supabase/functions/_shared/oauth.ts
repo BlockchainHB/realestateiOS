@@ -204,6 +204,16 @@ export async function readGoogleMailboxIdentity(
   return await gmailApi(bundle, "/profile");
 }
 
+export async function readGoogleMailboxIdentityWithRetry(
+  bundle: GoogleTokenBundle,
+): Promise<{ emailAddress: string; historyId: string }> {
+  try {
+    return await readGoogleMailboxIdentity(bundle);
+  } catch {
+    return await readGoogleMailboxIdentity(bundle);
+  }
+}
+
 export async function startGmailWatch(bundle: GoogleTokenBundle): Promise<{
   historyId: string;
   expiration: string;

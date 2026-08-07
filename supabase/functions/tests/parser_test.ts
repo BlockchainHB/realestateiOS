@@ -18,6 +18,7 @@ import {
   buildGoogleAuthorizationUrl,
   disconnectGoogleAccess,
   gmailRequestWithRefresh,
+  readGoogleMailboxIdentityWithRetry,
 } from "../_shared/oauth.ts";
 import type { NormalizedEmail } from "../_shared/parser.ts";
 import { parsePaymentNotification } from "../_shared/parser.ts";
@@ -204,6 +205,39 @@ Deno.test("Gmail 401 retries once with a refreshed token", async () => {
     "synthetic-stale-access",
     "synthetic-refreshed-access",
   ]);
+});
+
+Deno.test("Gmail mailbox identity retries one transient profile failure", async () => {
+  const originalFetch = globalThis.fetch;
+  let attempts = 0;
+  globalThis.fetch = (() => {
+    attempts += 1;
+    if (attempts === 1) {
+      return Promise.resolve(Response.json({ error: "transient" }, {
+        status: 503,
+      }));
+    }
+    return Promise.resolve(Response.json({
+      emailAddress: "shared@example.test",
+      historyId: "701",
+    }));
+  }) as typeof fetch;
+
+  try {
+    const identity = await readGoogleMailboxIdentityWithRetry({
+      accessToken: "synthetic-access",
+      refreshToken: "synthetic-refresh",
+      expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+    });
+    assertEquals(identity, {
+      emailAddress: "shared@example.test",
+      historyId: "701",
+    });
+    assertEquals(attempts, 2);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
 });
 
 Deno.test("permanently unavailable Gmail messages have a skippable error identity", async () => {

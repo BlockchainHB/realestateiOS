@@ -10,7 +10,7 @@ import {
   disconnectGoogleAccess,
   exchangeAuthorizationCode,
   type GoogleTokenBundle,
-  readGoogleMailboxIdentity,
+  readGoogleMailboxIdentityWithRetry,
   startGmailWatch,
 } from "../_shared/oauth.ts";
 import { synchronizeConnection } from "../_shared/sync.ts";
@@ -63,24 +63,27 @@ export default {
     let connectionStored = false;
     try {
       issuedBundle = await exchangeAuthorizationCode(code, state.codeVerifier);
-      const mailbox = await readGoogleMailboxIdentity(issuedBundle);
+      const mailbox = await readGoogleMailboxIdentityWithRetry(issuedBundle);
       issuedProviderAccountId = mailbox.emailAddress.toLowerCase();
       await requireCompatibleMailbox(
         state.organizationId,
         mailbox.emailAddress,
       );
-      const watch = await startGmailWatch(issuedBundle);
-      const connectionId = await connectMailbox({
+      const bundleForConnection = issuedBundle;
+      const connected = await connectMailbox({
         organizationId: state.organizationId,
         userId: state.userId,
         providerAccountId: issuedProviderAccountId,
         inboxEmail: mailbox.emailAddress,
-        bundle: issuedBundle,
-        watch,
+        bundle: bundleForConnection,
+        startWatch: () => startGmailWatch(bundleForConnection),
       });
       connectionStored = true;
       try {
-        await synchronizeConnection(connectionId, watch.historyId);
+        await synchronizeConnection(
+          connected.connectionId,
+          connected.watch.historyId,
+        );
       } catch (error) {
         console.error("Gmail catch-up synchronization was delayed", {
           code: error instanceof HttpError ? error.code : "sync_failed",
@@ -90,25 +93,26 @@ export default {
     } catch (error) {
       if (issuedBundle && !connectionStored) {
         const bundleToCleanup = issuedBundle;
-        const cleanup = issuedProviderAccountId
-          ? await cleanupProviderAccessIfUnused(
+        if (!issuedProviderAccountId) {
+          console.error(
+            "Failed Gmail authorization cleanup was deferred because mailbox identity is unknown",
+          );
+        } else {
+          const cleanup = await cleanupProviderAccessIfUnused(
             issuedProviderAccountId,
             () => disconnectGoogleAccess(bundleToCleanup),
-          )
-          : {
-            attempted: true,
-            result: await disconnectGoogleAccess(bundleToCleanup),
-          };
-        if (cleanup.attempted && cleanup.result) {
-          console.error("Failed Gmail authorization cleanup was attempted", {
-            provider_revocation: cleanup.result.revocation,
-            token_refresh_failed: cleanup.result.tokenRefreshFailed,
-            watch_stop_failed: cleanup.result.watchStopFailed,
-          });
-        } else {
-          console.error(
-            "Failed Gmail authorization cleanup preserved shared mailbox access",
           );
+          if (cleanup.attempted && cleanup.result) {
+            console.error("Failed Gmail authorization cleanup was attempted", {
+              provider_revocation: cleanup.result.revocation,
+              token_refresh_failed: cleanup.result.tokenRefreshFailed,
+              watch_stop_failed: cleanup.result.watchStopFailed,
+            });
+          } else {
+            console.error(
+              "Failed Gmail authorization cleanup preserved shared mailbox access",
+            );
+          }
         }
       }
       const code = error instanceof HttpError

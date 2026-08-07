@@ -46,16 +46,27 @@ export async function connectMailbox(input: {
   providerAccountId: string;
   inboxEmail: string;
   bundle: GoogleTokenBundle;
+  startWatch: () => Promise<{ historyId: string; expiration: string }>;
+}, sql = database()): Promise<{
+  connectionId: string;
   watch: { historyId: string; expiration: string };
-}): Promise<string> {
-  const sql = database();
+}> {
   const tokenCiphertext = await encryptJson(input.bundle);
   const providerAccountId = input.providerAccountId.toLowerCase();
   const inboxEmail = input.inboxEmail.toLowerCase();
   return await sql.begin(async (transaction) => {
-    await transaction`
-      select pg_advisory_xact_lock(hashtextextended(${providerAccountId}, 0))
+    const providerLocks = await transaction<{ acquired: boolean }[]>`
+      select pg_try_advisory_xact_lock(
+        hashtextextended(${providerAccountId}, 0)
+      ) as acquired
     `;
+    if (!providerLocks[0]?.acquired) {
+      throw new HttpError(
+        409,
+        "gmail_provider_operation_in_progress",
+        "Another connection attempt for this Gmail account is still finishing.",
+      );
+    }
     const pendingRevocations = await transaction<{ connection_id: string }[]>`
       select revocation.connection_id
       from private.gmail_token_revocations revocation
@@ -121,9 +132,10 @@ export async function connectMailbox(input: {
         "Disconnecting does not replace the mailbox identity retained by payment source records.",
       );
     }
+    const watch = await input.startWatch();
     const historyCursor = preservedHistoryCursor(
       existingConnections[0]?.last_history_id,
-      input.watch.historyId,
+      watch.historyId,
     );
 
     const connections = await transaction<{ id: string }[]>`
@@ -198,7 +210,7 @@ export async function connectMailbox(input: {
         ${connectionId},
         ${input.organizationId},
         ${historyCursor},
-        to_timestamp(${input.watch.expiration}::numeric / 1000),
+        to_timestamp(${watch.expiration}::numeric / 1000),
         'idle',
         0
       )
@@ -231,7 +243,7 @@ export async function connectMailbox(input: {
         ${transaction.json({ scope: "gmail.readonly" })}
       )
     `;
-    return connectionId;
+    return { connectionId, watch };
   });
 }
 

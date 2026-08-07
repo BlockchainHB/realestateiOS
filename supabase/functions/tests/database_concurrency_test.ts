@@ -2,8 +2,10 @@ import { assertEquals, assertMatch } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.9";
 import {
   cleanupProviderAccessIfUnused,
+  connectMailbox,
   disconnectMailbox,
 } from "../_shared/connections.ts";
+import { HttpError } from "../_shared/http.ts";
 import { claimNotificationReceipt } from "../_shared/notification-receipts.ts";
 import { saveToken } from "../_shared/token-store.ts";
 
@@ -327,6 +329,128 @@ Deno.test("shared mailbox provider cleanup waits for the final organization", as
       delete from public.gmail_connections
       where id in (${firstConnectionId}, ${secondConnectionId})
     `.catch(() => undefined);
+    await sql.end();
+  }
+});
+
+Deno.test("overlapping provider setup is rejected before a watch can start", async () => {
+  const sql = postgres(databaseUrl, { max: 3 });
+  const ownerId = "f0000000-0000-0000-0000-000000000001";
+  const organizationId = "f1000000-0000-0000-0000-000000000001";
+  const providerAccountId = "overlap@example.test";
+  Deno.env.set(
+    "GMAIL_TOKEN_ENCRYPTION_KEY",
+    "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  );
+
+  let firstConnectionId: string | null = null;
+  let releaseFirstWatch: (() => void) | undefined;
+  let firstSetup: ReturnType<typeof connectMailbox> | undefined;
+  try {
+    await sql`
+      delete from private.gmail_oauth_tokens
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from private.gmail_token_revocations
+      where connection_id in (
+        select id from public.gmail_connections
+        where organization_id = ${organizationId}
+      )
+    `;
+    await sql`
+      delete from public.gmail_sync_states
+      where organization_id = ${organizationId}
+    `;
+    await sql`
+      delete from public.gmail_connections
+      where organization_id = ${organizationId}
+    `;
+
+    const holdFirstWatch = new Promise<void>((resolve) => {
+      releaseFirstWatch = resolve;
+    });
+    let firstWatchStarted!: () => void;
+    const firstHasProviderLock = new Promise<void>((resolve) => {
+      firstWatchStarted = resolve;
+    });
+    let firstWatchCalls = 0;
+    firstSetup = connectMailbox({
+      organizationId,
+      userId: ownerId,
+      providerAccountId,
+      inboxEmail: providerAccountId,
+      bundle: {
+        accessToken: "synthetic-first-access",
+        refreshToken: "synthetic-first-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      },
+      startWatch: async () => {
+        firstWatchCalls += 1;
+        firstWatchStarted();
+        await holdFirstWatch;
+        return { historyId: "801", expiration: "1893456000000" };
+      },
+    }, sql);
+    await firstHasProviderLock;
+
+    let secondWatchCalls = 0;
+    const secondSetup = await connectMailbox({
+      organizationId,
+      userId: ownerId,
+      providerAccountId,
+      inboxEmail: providerAccountId,
+      bundle: {
+        accessToken: "synthetic-second-access",
+        refreshToken: "synthetic-second-refresh",
+        expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        scopes: ["https://www.googleapis.com/auth/gmail.readonly"],
+      },
+      startWatch: () => {
+        secondWatchCalls += 1;
+        return Promise.resolve({
+          historyId: "802",
+          expiration: "1893456000000",
+        });
+      },
+    }, sql).then(
+      () => ({ error: null }),
+      (error: unknown) => ({ error }),
+    );
+    assertEquals(secondSetup.error instanceof HttpError, true);
+    assertEquals(
+      secondSetup.error instanceof HttpError ? secondSetup.error.code : null,
+      "gmail_provider_operation_in_progress",
+    );
+    assertEquals(secondWatchCalls, 0);
+
+    releaseFirstWatch?.();
+    const firstResult = await firstSetup;
+    firstConnectionId = firstResult.connectionId;
+    assertEquals(firstWatchCalls, 1);
+    assertEquals(firstResult.watch.historyId, "801");
+  } finally {
+    releaseFirstWatch?.();
+    const unfinishedResult = await firstSetup?.catch(() => null);
+    firstConnectionId ??= unfinishedResult?.connectionId ?? null;
+    if (firstConnectionId) {
+      await sql`
+        delete from private.gmail_oauth_tokens
+        where connection_id = ${firstConnectionId}
+      `.catch(() => undefined);
+      await sql`
+        delete from public.gmail_sync_states
+        where connection_id = ${firstConnectionId}
+      `.catch(() => undefined);
+      await sql`
+        delete from public.gmail_connections
+        where id = ${firstConnectionId}
+      `.catch(() => undefined);
+    }
     await sql.end();
   }
 });
