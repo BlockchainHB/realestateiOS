@@ -1,5 +1,7 @@
 # Canadian property-management iOS backend foundation
 
+New to the project? Ask Codex: **“Read `HANDOFF.md` and do the handoff.”** It will explain what exists in plain language, guide the Supabase and Google Cloud setup one checkpoint at a time, and then help choose the next small milestone.
+
 This repository currently contains the approved [product requirements](PRD.md) and the Supabase/Gmail beta foundation:
 
 - passwordless-email and native Sign in with Apple readiness;
