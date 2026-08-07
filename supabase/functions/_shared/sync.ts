@@ -20,6 +20,26 @@ interface HistoryResponse {
   nextPageToken?: string;
 }
 
+interface MessageListResponse {
+  messages?: Array<{ id?: string }>;
+  nextPageToken?: string;
+}
+
+interface MailboxProfile {
+  historyId?: string;
+}
+
+interface GmailChangeSet {
+  cursor: string | null;
+  messageIds: Set<string>;
+  recoveredExpiredCursor: boolean;
+}
+
+type GmailRequester = <T>(
+  path: string,
+  errors?: { notFoundCode?: string; notFoundMessage?: string },
+) => Promise<T>;
+
 interface WatchRenewalDependencies {
   sql?: ReturnType<typeof database>;
   startWatch?: (
@@ -53,6 +73,120 @@ export function gmailHistoryParameters(
   });
   if (pageToken) parameters.set("pageToken", pageToken);
   return parameters;
+}
+
+export function gmailRecoveryParameters(
+  lastSuccessfulSyncAt: string | null,
+  pageToken?: string,
+): URLSearchParams {
+  const candidateQuery =
+    '{from:interac subject:interac from:"e-transfer" subject:"e-transfer"}';
+  const lastSuccessfulSyncTime = lastSuccessfulSyncAt
+    ? Date.parse(lastSuccessfulSyncAt)
+    : Number.NaN;
+  const after = Number.isFinite(lastSuccessfulSyncTime)
+    ? ` after:${Math.max(0, Math.floor(lastSuccessfulSyncTime / 1_000) - 1)}`
+    : "";
+  const parameters = new URLSearchParams({
+    labelIds: "INBOX",
+    maxResults: "500",
+    q: `${candidateQuery}${after}`,
+  });
+  if (pageToken) parameters.set("pageToken", pageToken);
+  return parameters;
+}
+
+async function collectIncrementalChanges(
+  startHistoryId: string,
+  notifiedHistoryId: string | undefined,
+  requestGmail: GmailRequester,
+): Promise<GmailChangeSet> {
+  let pageToken: string | undefined;
+  let cursor = maxHistoryId(startHistoryId, notifiedHistoryId);
+  const messageIds = new Set<string>();
+  do {
+    const params = gmailHistoryParameters(startHistoryId, pageToken);
+    const history = await requestGmail<HistoryResponse>(
+      `/history?${params.toString()}`,
+      {
+        notFoundCode: "gmail_history_expired",
+        notFoundMessage:
+          "The saved Gmail history cursor is no longer available.",
+      },
+    );
+    cursor = maxHistoryId(
+      cursor,
+      history.historyId,
+      ...(history.history ?? []).map((entry) => entry.id),
+    );
+    for (const entry of history.history ?? []) {
+      for (const added of entry.messagesAdded ?? []) {
+        if (added.message?.id) messageIds.add(added.message.id);
+      }
+    }
+    pageToken = history.nextPageToken;
+  } while (pageToken);
+  return { cursor, messageIds, recoveredExpiredCursor: false };
+}
+
+export async function collectGmailChanges(
+  startHistoryId: string,
+  notifiedHistoryId: string | undefined,
+  lastSuccessfulSyncAt: string | null,
+  requestGmail: GmailRequester,
+): Promise<GmailChangeSet> {
+  try {
+    return await collectIncrementalChanges(
+      startHistoryId,
+      notifiedHistoryId,
+      requestGmail,
+    );
+  } catch (error) {
+    if (
+      !(error instanceof HttpError) || error.code !== "gmail_history_expired"
+    ) {
+      throw error;
+    }
+  }
+
+  const profile = await requestGmail<MailboxProfile>("/profile");
+  if (!profile.historyId) {
+    throw new HttpError(
+      502,
+      "gmail_history_recovery_failed",
+      "Gmail did not provide a recovery history cursor.",
+    );
+  }
+
+  const recoveryMessageIds = new Set<string>();
+  let pageToken: string | undefined;
+  do {
+    const parameters = gmailRecoveryParameters(
+      lastSuccessfulSyncAt,
+      pageToken,
+    );
+    const page = await requestGmail<MessageListResponse>(
+      `/messages?${parameters.toString()}`,
+    );
+    for (const message of page.messages ?? []) {
+      if (message.id) recoveryMessageIds.add(message.id);
+    }
+    pageToken = page.nextPageToken;
+  } while (pageToken);
+
+  const incremental = await collectIncrementalChanges(
+    profile.historyId,
+    notifiedHistoryId,
+    requestGmail,
+  );
+  for (const messageId of incremental.messageIds) {
+    recoveryMessageIds.add(messageId);
+  }
+  return {
+    cursor: incremental.cursor,
+    messageIds: recoveryMessageIds,
+    recoveredExpiredCursor: true,
+  };
 }
 
 async function refreshConnectionToken(
@@ -142,9 +276,13 @@ export async function synchronizeConnection(
   const rows = await sql<{
     organization_id: string;
     last_history_id: string | null;
+    last_successful_sync_at: string | null;
     status: string;
   }[]>`
-    select connection.organization_id, state.last_history_id, connection.status
+    select connection.organization_id,
+           state.last_history_id,
+           connection.last_successful_sync_at,
+           connection.status
     from public.gmail_connections connection
     join public.gmail_sync_states state on state.connection_id = connection.id
     where connection.id = ${connectionId}
@@ -171,6 +309,13 @@ export async function synchronizeConnection(
     bundle = response.bundle;
     return response.result;
   };
+  const requestGmailPath: GmailRequester = <T>(
+    path: string,
+    errors = {},
+  ) =>
+    requestGmail((currentBundle) =>
+      gmailApi<T>(currentBundle, path, {}, errors)
+    );
   if (!connection.last_history_id) {
     return { processed: 0, cursor: notifiedHistoryId ?? null };
   }
@@ -181,35 +326,16 @@ export async function synchronizeConnection(
     where connection_id = ${connectionId}
   `;
   try {
-    let pageToken: string | undefined;
-    let cursor = maxHistoryId(connection.last_history_id, notifiedHistoryId);
-    const messageIds = new Set<string>();
-    do {
-      const params = gmailHistoryParameters(
-        connection.last_history_id,
-        pageToken,
-      );
-      const history = await requestGmail((currentBundle) =>
-        gmailApi<HistoryResponse>(
-          currentBundle,
-          `/history?${params.toString()}`,
-        )
-      );
-      cursor = maxHistoryId(
-        cursor,
-        history.historyId,
-        ...(history.history ?? []).map((entry) => entry.id),
-      );
-      for (const entry of history.history ?? []) {
-        for (const added of entry.messagesAdded ?? []) {
-          if (added.message?.id) messageIds.add(added.message.id);
-        }
-      }
-      pageToken = history.nextPageToken;
-    } while (pageToken);
+    const changes = await collectGmailChanges(
+      connection.last_history_id,
+      notifiedHistoryId,
+      connection.last_successful_sync_at,
+      requestGmailPath,
+    );
+    const cursor = changes.cursor;
 
     let processed = 0;
-    for (const messageId of messageIds) {
+    for (const messageId of changes.messageIds) {
       let email: Awaited<ReturnType<typeof getNormalizedEmail>>;
       try {
         email = await requestGmail((currentBundle) =>

@@ -23,7 +23,11 @@ import {
 import type { NormalizedEmail } from "../_shared/parser.ts";
 import { parsePaymentNotification } from "../_shared/parser.ts";
 import { readPubSubNotification } from "../_shared/pubsub.ts";
-import { gmailHistoryParameters } from "../_shared/sync.ts";
+import {
+  collectGmailChanges,
+  gmailHistoryParameters,
+  gmailRecoveryParameters,
+} from "../_shared/sync.ts";
 import { parseSyntheticPaymentFixture } from "./synthetic-parser.ts";
 
 async function fixture(name: string): Promise<NormalizedEmail> {
@@ -170,6 +174,67 @@ Deno.test("Gmail history synchronization is scoped to the watched inbox", () => 
   assertEquals(parameters.get("historyTypes"), "messageAdded");
   assertEquals(parameters.get("labelId"), "INBOX");
   assertEquals(parameters.get("pageToken"), "next-page");
+});
+
+Deno.test("expired Gmail history uses a bounded candidate recovery scan", async () => {
+  const lastSuccessfulSyncAt = "2030-01-01T00:00:00.000Z";
+  const recovery = gmailRecoveryParameters(lastSuccessfulSyncAt, "page-2");
+  assertEquals(recovery.get("labelIds"), "INBOX");
+  assertEquals(recovery.get("maxResults"), "500");
+  assertEquals(recovery.get("pageToken"), "page-2");
+  assertEquals(
+    recovery.get("q"),
+    '{from:interac subject:interac from:"e-transfer" subject:"e-transfer"} after:1893455999',
+  );
+
+  const requestedPaths: string[] = [];
+  const changes = await collectGmailChanges(
+    "101",
+    "905",
+    lastSuccessfulSyncAt,
+    <T>(path: string): Promise<T> => {
+      requestedPaths.push(path);
+      const url = new URL(`https://gmail.example.test${path}`);
+      if (
+        url.pathname === "/history" &&
+        url.searchParams.get("startHistoryId") === "101"
+      ) {
+        throw new HttpError(
+          404,
+          "gmail_history_expired",
+          "Synthetic expired cursor.",
+        );
+      }
+      if (url.pathname === "/profile") {
+        return Promise.resolve({ historyId: "900" } as T);
+      }
+      if (url.pathname === "/messages") {
+        return Promise.resolve({
+          messages: [{ id: "candidate-before-anchor" }],
+        } as T);
+      }
+      if (
+        url.pathname === "/history" &&
+        url.searchParams.get("startHistoryId") === "900"
+      ) {
+        return Promise.resolve({
+          historyId: "906",
+          history: [{
+            id: "906",
+            messagesAdded: [{ message: { id: "candidate-after-anchor" } }],
+          }],
+        } as T);
+      }
+      throw new Error(`Unexpected Gmail request: ${path}`);
+    },
+  );
+  assertEquals(changes.cursor, "906");
+  assertEquals(changes.recoveredExpiredCursor, true);
+  assertEquals([...changes.messageIds].sort(), [
+    "candidate-after-anchor",
+    "candidate-before-anchor",
+  ]);
+  assertEquals(requestedPaths.length, 4);
 });
 
 Deno.test("Gmail 401 retries once with a refreshed token", async () => {
