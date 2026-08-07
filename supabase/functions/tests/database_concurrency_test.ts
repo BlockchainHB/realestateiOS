@@ -1,6 +1,9 @@
 import { assertEquals, assertMatch } from "jsr:@std/assert@1.0.14";
 import postgres from "npm:postgres@3.4.9";
-import { disconnectMailbox } from "../_shared/connections.ts";
+import {
+  cleanupProviderAccessIfUnused,
+  disconnectMailbox,
+} from "../_shared/connections.ts";
 import { claimNotificationReceipt } from "../_shared/notification-receipts.ts";
 import { saveToken } from "../_shared/token-store.ts";
 
@@ -280,6 +283,18 @@ Deno.test("shared mailbox provider cleanup waits for the final organization", as
         (${firstConnectionId}, ${firstOrganizationId}, ${providerAccountId}, ${providerAccountId}, ${ownerId}),
         (${secondConnectionId}, ${secondOrganizationId}, ${providerAccountId}, ${providerAccountId}, ${ownerId})
     `;
+
+    let failedCallbackCleanupCalls = 0;
+    const failedCallbackCleanup = await cleanupProviderAccessIfUnused(
+      providerAccountId,
+      () => {
+        failedCallbackCleanupCalls += 1;
+        return Promise.resolve("cleaned");
+      },
+      sql,
+    );
+    assertEquals(failedCallbackCleanup, { attempted: false, result: null });
+    assertEquals(failedCallbackCleanupCalls, 0);
 
     const firstDisconnect = await disconnectMailbox({
       connectionId: firstConnectionId,

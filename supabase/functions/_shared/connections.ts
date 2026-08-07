@@ -260,6 +260,30 @@ export async function connectedMailboxesByEmail(
   `;
 }
 
+export async function cleanupProviderAccessIfUnused<T>(
+  providerAccountId: string,
+  cleanup: () => Promise<T>,
+  sql = database(),
+): Promise<{ attempted: boolean; result: T | null }> {
+  return await sql.begin(async (transaction) => {
+    const normalizedProviderAccountId = providerAccountId.toLowerCase();
+    await transaction`
+      select pg_advisory_xact_lock(
+        hashtextextended(${normalizedProviderAccountId}, 0)
+      )
+    `;
+    const activeConnections = await transaction<{ id: string }[]>`
+      select id
+      from public.gmail_connections
+      where provider_account_id = ${normalizedProviderAccountId}
+        and status <> 'disconnected'
+      limit 1
+    `;
+    if (activeConnections[0]) return { attempted: false, result: null };
+    return { attempted: true, result: await cleanup() };
+  });
+}
+
 export async function disconnectMailbox(input: {
   connectionId: string;
   organizationId: string;

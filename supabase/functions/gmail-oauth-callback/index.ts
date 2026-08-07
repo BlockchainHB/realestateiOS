@@ -1,6 +1,7 @@
 import "@supabase/functions-js/edge-runtime.d.ts";
 import { withSupabase } from "@supabase/server";
 import {
+  cleanupProviderAccessIfUnused,
   connectMailbox,
   requireCompatibleMailbox,
 } from "../_shared/connections.ts";
@@ -58,10 +59,12 @@ export default {
     }
 
     let issuedBundle: GoogleTokenBundle | null = null;
+    let issuedProviderAccountId: string | null = null;
     let connectionStored = false;
     try {
       issuedBundle = await exchangeAuthorizationCode(code, state.codeVerifier);
       const mailbox = await readGoogleMailboxIdentity(issuedBundle);
+      issuedProviderAccountId = mailbox.emailAddress.toLowerCase();
       await requireCompatibleMailbox(
         state.organizationId,
         mailbox.emailAddress,
@@ -70,7 +73,7 @@ export default {
       const connectionId = await connectMailbox({
         organizationId: state.organizationId,
         userId: state.userId,
-        providerAccountId: mailbox.emailAddress.toLowerCase(),
+        providerAccountId: issuedProviderAccountId,
         inboxEmail: mailbox.emailAddress,
         bundle: issuedBundle,
         watch,
@@ -86,12 +89,27 @@ export default {
       return completionRedirect(state.returnUrl, "connected");
     } catch (error) {
       if (issuedBundle && !connectionStored) {
-        const cleanup = await disconnectGoogleAccess(issuedBundle);
-        console.error("Failed Gmail authorization cleanup was attempted", {
-          provider_revocation: cleanup.revocation,
-          token_refresh_failed: cleanup.tokenRefreshFailed,
-          watch_stop_failed: cleanup.watchStopFailed,
-        });
+        const bundleToCleanup = issuedBundle;
+        const cleanup = issuedProviderAccountId
+          ? await cleanupProviderAccessIfUnused(
+            issuedProviderAccountId,
+            () => disconnectGoogleAccess(bundleToCleanup),
+          )
+          : {
+            attempted: true,
+            result: await disconnectGoogleAccess(bundleToCleanup),
+          };
+        if (cleanup.attempted && cleanup.result) {
+          console.error("Failed Gmail authorization cleanup was attempted", {
+            provider_revocation: cleanup.result.revocation,
+            token_refresh_failed: cleanup.result.tokenRefreshFailed,
+            watch_stop_failed: cleanup.result.watchStopFailed,
+          });
+        } else {
+          console.error(
+            "Failed Gmail authorization cleanup preserved shared mailbox access",
+          );
+        }
       }
       const code = error instanceof HttpError
         ? error.code

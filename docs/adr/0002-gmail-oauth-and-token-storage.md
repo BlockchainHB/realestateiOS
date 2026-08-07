@@ -28,7 +28,7 @@ Pub/Sub push uses a dedicated service account and authenticated push. The endpoi
 
 Watches are selected for renewal two days before expiry and should be scheduled daily. Recovery synchronization calls `history.list` for connections without a recent successful sync. If Google can no longer serve the cursor, the connection moves to a delayed/reauthorization-safe state; this foundation does not perform a speculative full-mailbox scan.
 
-One Google mailbox may serve multiple organizations, while Gmail watches and OAuth revocation are mailbox/provider-wide. Connect and disconnect transitions therefore serialize on the canonical Google account identity. Disconnect is local for one organization while another active connection remains; watch shutdown and grant revocation occur only when the final active organization disconnects. A pending final revocation blocks reconnect until provider cleanup succeeds.
+One Google mailbox may serve multiple organizations, while Gmail watches and OAuth revocation are mailbox/provider-wide. Connect, disconnect, and failed-callback cleanup transitions therefore serialize on the canonical Google account identity. Disconnect is local for one organization while another active connection remains; watch shutdown and grant revocation occur only when no active organization depends on the mailbox. A pending final revocation blocks reconnect until provider cleanup succeeds.
 
 ## Parser boundary
 
